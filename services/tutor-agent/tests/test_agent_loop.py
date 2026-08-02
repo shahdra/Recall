@@ -7,7 +7,7 @@ for: tool routing, the iteration cap, and what happens when a tool explodes.
 
 from conftest import FakeLLM, FakeMessage
 
-from agent_loop import run_agent
+from agent_loop import arun_agent
 
 
 class FakeTool:
@@ -30,15 +30,15 @@ def _tool_call(name, args=None, call_id="call_1"):
     return {"name": name, "args": args or {}, "id": call_id}
 
 
-def test_returns_answer_without_calling_tools():
+async def test_returns_answer_without_calling_tools():
     llm = FakeLLM([FakeMessage(content="Nothing is due today.")])
-    out = run_agent([{"role": "user", "content": "hi"}], llm, {})
+    out = await arun_agent([{"role": "user", "content": "hi"}], llm, {})
     assert out["response"] == "Nothing is due today."
     assert out["tools_called"] == []
     assert out["capped"] is False
 
 
-def test_calls_tool_then_returns_answer():
+async def test_calls_tool_then_returns_answer():
     llm = FakeLLM(
         [
             FakeMessage(tool_calls=[_tool_call("get_due_cards", {"user_id": "u1"})]),
@@ -46,22 +46,22 @@ def test_calls_tool_then_returns_answer():
         ]
     )
     tools = {"get_due_cards": FakeTool("get_due_cards", "2 cards")}
-    out = run_agent([{"role": "user", "content": "what's due?"}], llm, tools)
+    out = await arun_agent([{"role": "user", "content": "what's due?"}], llm, tools)
     assert out["tools_called"] == ["get_due_cards"]
     assert "done" in out["response"]
     assert tools["get_due_cards"].calls == [{"user_id": "u1"}]
 
 
-def test_iteration_cap_prevents_runaway():
+async def test_iteration_cap_prevents_runaway():
     always_tool = FakeLLM([FakeMessage(tool_calls=[_tool_call("noop")])])
     tools = {"noop": FakeTool("noop")}
-    out = run_agent([{"role": "user", "content": "go"}], always_tool, tools, max_iterations=3)
+    out = await arun_agent([{"role": "user", "content": "go"}], always_tool, tools, max_iterations=3)
     assert out["capped"] is True
     assert out["iterations"] == 3
     assert out["response"]  # must still say something to the learner
 
 
-def test_multiple_tool_calls_in_one_turn_all_run():
+async def test_multiple_tool_calls_in_one_turn_all_run():
     llm = FakeLLM(
         [
             FakeMessage(
@@ -74,13 +74,13 @@ def test_multiple_tool_calls_in_one_turn_all_run():
         ]
     )
     tools = {"a": FakeTool("a"), "b": FakeTool("b")}
-    out = run_agent([{"role": "user", "content": "go"}], llm, tools)
+    out = await arun_agent([{"role": "user", "content": "go"}], llm, tools)
     assert out["tools_called"] == ["a", "b"]
     assert len(tools["a"].calls) == 1
     assert len(tools["b"].calls) == 1
 
 
-def test_unknown_tool_is_reported_to_the_model_not_raised():
+async def test_unknown_tool_is_reported_to_the_model_not_raised():
     """A hallucinated tool name must not crash the request."""
     llm = FakeLLM(
         [
@@ -88,11 +88,11 @@ def test_unknown_tool_is_reported_to_the_model_not_raised():
             FakeMessage(content="recovered"),
         ]
     )
-    out = run_agent([{"role": "user", "content": "go"}], llm, {})
+    out = await arun_agent([{"role": "user", "content": "go"}], llm, {})
     assert out["response"] == "recovered"
 
 
-def test_tool_exception_is_fed_back_not_raised():
+async def test_tool_exception_is_fed_back_not_raised():
     llm = FakeLLM(
         [
             FakeMessage(tool_calls=[_tool_call("boom")]),
@@ -100,27 +100,27 @@ def test_tool_exception_is_fed_back_not_raised():
         ]
     )
     tools = {"boom": FakeTool("boom", raises=RuntimeError("dynamo down"))}
-    out = run_agent([{"role": "user", "content": "go"}], llm, tools)
+    out = await arun_agent([{"role": "user", "content": "go"}], llm, tools)
     assert out["response"] == "handled it"
     assert out["tool_errors"] == 1
 
 
-def test_llm_failure_returns_graceful_message():
+async def test_llm_failure_returns_graceful_message():
     llm = FakeLLM([RuntimeError("bedrock 503")])
-    out = run_agent([{"role": "user", "content": "go"}], llm, {})
+    out = await arun_agent([{"role": "user", "content": "go"}], llm, {})
     assert out["llm_failed"] is True
     assert "Traceback" not in out["response"]
     assert out["response"]
 
 
-def test_tools_are_bound_to_the_model():
+async def test_tools_are_bound_to_the_model():
     llm = FakeLLM([FakeMessage(content="ok")])
     tools = {"a": FakeTool("a")}
-    run_agent([{"role": "user", "content": "go"}], llm, tools)
+    await arun_agent([{"role": "user", "content": "go"}], llm, tools)
     assert llm.bound_tools == [tools["a"]]
 
 
-def test_conversation_history_is_preserved_and_extended():
+async def test_conversation_history_is_preserved_and_extended():
     llm = FakeLLM(
         [
             FakeMessage(tool_calls=[_tool_call("a")]),
@@ -128,32 +128,32 @@ def test_conversation_history_is_preserved_and_extended():
         ]
     )
     tools = {"a": FakeTool("a")}
-    out = run_agent([{"role": "user", "content": "go"}], llm, tools)
+    out = await arun_agent([{"role": "user", "content": "go"}], llm, tools)
     # The second call must include the tool result the first turn produced.
     assert "tool result" in str(llm.received[1])
     assert out["messages"][0]["content"] == "go"
 
 
-def test_iteration_count_reflects_actual_llm_calls():
+async def test_iteration_count_reflects_actual_llm_calls():
     llm = FakeLLM(
         [
             FakeMessage(tool_calls=[_tool_call("a")]),
             FakeMessage(content="done"),
         ]
     )
-    out = run_agent([{"role": "user", "content": "go"}], llm, {"a": FakeTool("a")})
+    out = await arun_agent([{"role": "user", "content": "go"}], llm, {"a": FakeTool("a")})
     assert out["iterations"] == 2
 
 
-def test_empty_content_with_no_tool_calls_still_returns_something():
+async def test_empty_content_with_no_tool_calls_still_returns_something():
     llm = FakeLLM([FakeMessage(content="")])
-    out = run_agent([{"role": "user", "content": "go"}], llm, {})
+    out = await arun_agent([{"role": "user", "content": "go"}], llm, {})
     assert out["response"]
 
 
-def test_capped_run_reports_tools_it_did_call():
+async def test_capped_run_reports_tools_it_did_call():
     llm = FakeLLM([FakeMessage(tool_calls=[_tool_call("a")])])
-    out = run_agent(
+    out = await arun_agent(
         [{"role": "user", "content": "go"}], llm, {"a": FakeTool("a")}, max_iterations=2
     )
     assert out["capped"] is True

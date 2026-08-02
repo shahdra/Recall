@@ -62,15 +62,40 @@ class FallbackChatModel:
         self.secondary = secondary
         self.retries = max(1, retries)
         self.backoff_seconds = backoff_seconds
-        self.failure_count = 0
-        self.fallback_count = 0
+        # Counters live in a shared dict so copies made by bind_tools report into
+        # the same totals the metrics endpoint reads.
+        self._counter_source = {"failures": 0, "fallbacks": 0}
+
+    @property
+    def failure_count(self) -> int:
+        return self._counter_source["failures"]
+
+    @property
+    def fallback_count(self) -> int:
+        return self._counter_source["fallbacks"]
 
     def bind_tools(self, tools, **kwargs):
-        """Bind tools to both models, so either can answer with the same toolset."""
-        self.primary = self.primary.bind_tools(tools, **kwargs)
-        if self.secondary is not None:
-            self.secondary = self.secondary.bind_tools(tools, **kwargs)
-        return self
+        """Return a NEW wrapper with tools bound to both models.
+
+        Returning a copy rather than mutating ``self`` is what LangChain's own
+        ``bind_tools`` contract promises, and here it is load-bearing: the app
+        shares one module-level model between the orchestrator and both
+        sub-agents. Mutating in place leaked the orchestrator's tool bindings
+        into the Card-Generator, which then sent Bedrock a card-generation prompt
+        with tool definitions attached and got an InternalFailure — one /chat call
+        permanently degraded every later /decks call in the same process.
+        """
+        bound = FallbackChatModel(
+            self.primary.bind_tools(tools, **kwargs),
+            self.secondary.bind_tools(tools, **kwargs)
+            if self.secondary is not None
+            else None,
+            retries=self.retries,
+            backoff_seconds=self.backoff_seconds,
+        )
+        # Share failure counters with the parent so metrics stay aggregated.
+        bound._counter_source = self._counter_source
+        return bound
 
     def invoke(self, messages, **kwargs):
         """Invoke the primary with retries, then the secondary once.
@@ -87,7 +112,7 @@ class FallbackChatModel:
                 return self.primary.invoke(messages, **kwargs)
             except Exception as exc:
                 last_error = exc
-                self.failure_count += 1
+                self._counter_source["failures"] += 1
                 logger.warning(
                     "primary model invoke failed (attempt %d/%d): %s",
                     attempt + 1,
@@ -102,11 +127,11 @@ class FallbackChatModel:
             raise last_error
 
         logger.warning("falling back to secondary model")
-        self.fallback_count += 1
+        self._counter_source["fallbacks"] += 1
         try:
             return self.secondary.invoke(messages, **kwargs)
         except Exception as exc:
-            self.failure_count += 1
+            self._counter_source["failures"] += 1
             logger.error("fallback model also failed: %s", exc)
             raise
 

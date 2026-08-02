@@ -33,11 +33,20 @@ def _build_tables() -> storage.Tables:
     Deferred behind a function so importing this module needs no AWS
     credentials — tests replace ``TABLES`` before any call is made.
     """
+    # Prefer the DynamoDB-scoped override. The unscoped AWS_ENDPOINT_URL applies
+    # to *every* AWS service in boto3, so setting it for DynamoDB Local also
+    # redirects Bedrock — the tutor-agent then sends model requests to the local
+    # database and gets an opaque InternalFailure.
+    endpoint = (
+        os.environ.get("AWS_ENDPOINT_URL_DYNAMODB")
+        or os.environ.get("RECALL_DYNAMODB_ENDPOINT")
+        or None
+    )
     return storage.Tables(
         resource=boto3.resource(
             "dynamodb",
             region_name=os.environ.get("AWS_REGION", "us-east-1"),
-            endpoint_url=os.environ.get("AWS_ENDPOINT_URL") or None,
+            endpoint_url=endpoint,
         ),
         cards=os.environ.get("RECALL_CARDS_TABLE", "Cards"),
         decks=os.environ.get("RECALL_DECKS_TABLE", "Decks"),
@@ -215,7 +224,7 @@ async def health(request: Request) -> JSONResponse:
 
 
 @mcp.tool
-def create_deck(user_id: str, title: str, source_s3_key: str = None) -> dict:
+def create_deck(user_id: str, title: str, source_s3_key: str | None = None) -> dict:
     """Create a new empty study deck for a user."""
     return _create_deck(user_id, title, source_s3_key)
 
@@ -259,10 +268,10 @@ def get_profile(user_id: str) -> dict:
 @mcp.tool
 def update_profile(
     user_id: str,
-    notes: str = None,
-    weak_topics: dict = None,
-    preferences: dict = None,
-    stats: dict = None,
+    notes: str | None = None,
+    weak_topics: dict | None = None,
+    preferences: dict | None = None,
+    stats: dict | None = None,
 ) -> dict:
     """Update a learner's long-term profile. Only the fields given are changed."""
     return _update_profile(user_id, notes, weak_topics, preferences, stats)

@@ -16,6 +16,7 @@ and the loop cannot run forever: ``max_iterations`` bounds it, and hitting that
 bound returns a real answer rather than an exception.
 """
 
+import asyncio
 import json
 import logging
 
@@ -48,16 +49,46 @@ def _tool_result_message(call_id: str, name: str, content: str) -> dict:
 
 
 def _stringify(result) -> str:
-    """Tool results go back to the model as text."""
+    """Tool results go back to the model as text.
+
+    MCP returns content blocks — ``[{"type": "text", "text": "..."}]`` — so flatten
+    those to their text rather than showing the model the wrapper.
+    """
     if isinstance(result, str):
         return result
+
+    if isinstance(result, list):
+        texts = [
+            block.get("text", "")
+            for block in result
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        if texts:
+            return "\n".join(texts)
+
     try:
         return json.dumps(result, default=str)
     except (TypeError, ValueError):
         return str(result)
 
 
-def run_agent(
+async def _invoke_tool(tool, args):
+    """Invoke a tool, preferring the async path.
+
+    Tools from langchain-mcp-adapters are async-only: their sync ``invoke``
+    raises NotImplementedError. Locally-defined ``@tool`` functions are sync. Try
+    async first and fall back, so one registry can hold both.
+    """
+    ainvoke = getattr(tool, "ainvoke", None)
+    if ainvoke is not None:
+        try:
+            return await ainvoke(args)
+        except NotImplementedError:
+            pass  # sync-only tool; fall through
+    return tool.invoke(args)
+
+
+async def arun_agent(
     messages: list,
     llm,
     tools: dict,
@@ -137,7 +168,7 @@ def run_agent(
                 continue
 
             try:
-                result = tool.invoke(args)
+                result = await _invoke_tool(tool, args)
             except Exception as exc:
                 logger.exception("tool %r failed", name)
                 tool_errors += 1
@@ -159,3 +190,18 @@ def run_agent(
         "llm_failed": False,
         "messages": conversation,
     }
+
+
+def run_agent(
+    messages: list,
+    llm,
+    tools: dict,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+) -> dict:
+    """Synchronous wrapper around :func:`arun_agent`.
+
+    For callers outside an event loop — scripts, the Agent Skill, tests. Inside a
+    running loop (any FastAPI handler), await ``arun_agent`` directly instead;
+    this would raise there, as asyncio forbids nesting ``run``.
+    """
+    return asyncio.run(arun_agent(messages, llm, tools, max_iterations))

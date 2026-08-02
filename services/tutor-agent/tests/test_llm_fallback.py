@@ -82,7 +82,44 @@ def test_bind_tools_binds_both_models():
     bound = model.bind_tools(["toolA"])
     assert primary.bound == ["toolA"]
     assert secondary.bound == ["toolA"]
-    assert bound is model
+
+
+def test_bind_tools_does_not_mutate_the_original():
+    """The app shares one model between the orchestrator and both sub-agents.
+
+    If bind_tools mutated in place, the orchestrator's tools would leak into the
+    Card-Generator, which then sends Bedrock a card-generation prompt with tool
+    definitions attached and gets an InternalFailure. One /chat call would
+    permanently degrade every later /decks call in the same process.
+    """
+
+    class Marker:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def bind_tools(self, tools, **kwargs):
+            return Marker(f"{self.tag}+bound")
+
+        def invoke(self, messages, **kwargs):
+            return FakeMessage(content=self.tag)
+
+    model = FallbackChatModel(Marker("plain"), Marker("plain2"), retries=1)
+    bound = model.bind_tools(["toolA"])
+
+    assert bound is not model
+    assert model.invoke("hi").content == "plain"  # original still unbound
+    assert bound.invoke("hi").content == "plain+bound"
+
+
+def test_bound_copy_shares_failure_counters():
+    """Metrics read the original, so a bound copy's failures must still register."""
+    primary = Flaky("primary", fail_times=99)
+    secondary = Flaky("secondary")
+    model = FallbackChatModel(primary, secondary, retries=1, backoff_seconds=0)
+    bound = model.bind_tools([])
+    bound.invoke("hi")
+    assert model.failure_count >= 1
+    assert model.fallback_count == 1
 
 
 def test_works_with_no_secondary_configured():

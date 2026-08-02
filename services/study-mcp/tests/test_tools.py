@@ -122,6 +122,33 @@ def test_get_profile_default_for_new_user():
     assert out["weak_topics"] == {}
 
 
+def test_optional_params_accept_null_in_the_mcp_schema():
+    """Optional tool params must be nullable in the generated MCP schema.
+
+    ``source_s3_key: str = None`` looks optional in Python but generates a schema
+    that rejects null, so a deck made from pasted text (which has no S3 key)
+    fails validation before the tool body ever runs.
+    """
+    import asyncio
+
+    tools = {t.name: t for t in asyncio.run(app.mcp.list_tools())}
+
+    nullable = {
+        "create_deck": ["source_s3_key"],
+        "update_profile": ["notes", "weak_topics", "preferences", "stats"],
+    }
+
+    for tool_name, params in nullable.items():
+        schema = tools[tool_name].parameters
+        for param in params:
+            spec = schema["properties"][param]
+            types = spec.get("anyOf", [spec])
+            assert any(entry.get("type") == "null" for entry in types), (
+                f"{tool_name}.{param} rejects null; callers cannot omit it"
+            )
+            assert param not in schema.get("required", [])
+
+
 def test_mcp_exposes_expected_tools():
     """The agent discovers these names over MCP; renaming one breaks the agent."""
     import asyncio
