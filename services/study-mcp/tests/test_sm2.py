@@ -1,5 +1,3 @@
-import pytest
-
 from sm2 import schedule
 
 
