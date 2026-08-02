@@ -1,0 +1,45 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [study-mcp, tutor-agent]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: services/${{ matrix.service }}/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r services/${{ matrix.service }}/requirements.txt
+
+      - name: Run unit tests
+        working-directory: services/${{ matrix.service }}
+        run: pytest -v -m "not integration" --junitxml=results.xml
+
+      - name: Test summary
+        if: always()
+        run: |
+          echo "### ${{ matrix.service }} unit tests" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f services/${{ matrix.service }}/results.xml ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, xml.etree.ElementTree as ET
+          for path in glob.glob("services/*/results.xml"):
+              suite = ET.parse(path).getroot().find("testsuite") or ET.parse(path).getroot()
+              print(f"- tests: {suite.get('tests')} | failures: {suite.get('failures')} "
+                    f"| errors: {suite.get('errors')} | skipped: {suite.get('skipped')}")
+          PY
+          else
+            echo "- no results file produced" >> "$GITHUB_STEP_SUMMARY"
+          fi

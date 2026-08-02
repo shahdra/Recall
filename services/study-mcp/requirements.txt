@@ -1,0 +1,7 @@
+fastmcp
+boto3
+pydantic
+pytest
+pytest-cov
+moto[dynamodb,s3]
+httpx
