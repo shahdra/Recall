@@ -11,13 +11,13 @@
 
 **Architecture:** Three containerized services — `tutor-agent` (orchestrator with a manual ReAct loop hosting Card-Generator and Grader sub-agents), `study-mcp` (own MCP server exposing deck/card/SM-2/progress/memory tools over DynamoDB + S3), and `frontend` (web UI). The LLM only decides and picks tool arguments; Python code performs all I/O; SM-2 scheduling is deterministic and runs outside the LLM.
 
-**Tech Stack:** Python 3.11, FastAPI, LangChain (`init_chat_model`, manual ReAct loop), FastMCP, `langchain-mcp-adapters`, boto3 (S3/DynamoDB/SNS), `moto` (AWS mocks in tests), `pypdf` (PDF parsing), OpenAI Whisper API, `prometheus-fastapi-instrumentator`, pytest, Docker, Kubernetes (on EC2), Terraform, ArgoCD, GitHub Actions, Prometheus + Grafana.
+**Tech Stack:** Python 3.11, FastAPI, LangChain (`init_chat_model`, manual ReAct loop), FastMCP, `langchain-mcp-adapters`, boto3 (S3/DynamoDB/SNS), `moto` (AWS mocks in tests), `pypdf` (PDF parsing), Deepgram SDK (speech-to-text), `prometheus-fastapi-instrumentator`, pytest, Docker, Kubernetes (on EC2), Terraform, ArgoCD, GitHub Actions, Prometheus + Grafana.
 
 ## Global Constraints
 
 - **Language/runtime:** Python 3.11 for all backend services.
 - **No black-box agent frameworks.** Implement the ReAct loop manually. Do NOT use `create_react_agent`, `AgentExecutor`, or equivalent wrappers.
-- **The LLM never performs I/O or SM-2 math.** It only chooses tools and arguments. All DynamoDB/S3/SNS/Whisper calls are Python; SM-2 arithmetic is a pure function.
+- **The LLM never performs I/O or SM-2 math.** It only chooses tools and arguments. All DynamoDB/S3/SNS/Deepgram calls are Python; SM-2 arithmetic is a pure function.
 - **TDD:** every code task writes a failing test first, then the minimal implementation. Commit after each task.
 - **All AWS resources via Terraform.** No manual console clicking.
 - **Two environments:** `dev` and `prod` K8s namespaces with separate config.
@@ -713,7 +713,7 @@ def test_iteration_cap_prevents_runaway():
 - [ ] **Step 2–4: FAIL → implement → PASS**
 - [ ] **Step 5: Commit** → `git commit -m "feat(tutor-agent): system prompts + learner-profile memory injection"`
 
-### Task 3.8: Whisper voice transcription endpoint
+### Task 3.8: Deepgram voice transcription endpoint
 
 **Files:**
 - Create: `services/tutor-agent/voice.py`
@@ -721,11 +721,11 @@ def test_iteration_cap_prevents_runaway():
 - Test: `services/tutor-agent/tests/test_voice.py`
 
 **Interfaces:**
-- Produces: `def transcribe(audio_bytes: bytes, client) -> str` calling the OpenAI Whisper API via injected `client`; on any error returns `""` (caller then tells the user to type). `POST /transcribe` body `{audio_b64}` → `{text}`.
+- Produces: `def transcribe(audio_bytes: bytes, client, model="nova-3") -> str` calling Deepgram `listen.v1.media.transcribe_file` via injected `client`; on any error returns `""` (caller then tells the user to type). `POST /transcribe` body `{audio_b64}` → `{text}`.
 
 - [ ] **Step 1: Failing tests** — fake client returns text → returned; fake client raises → `""` (graceful).
 - [ ] **Step 2–4: FAIL → implement → PASS**
-- [ ] **Step 5: Commit** → `git commit -m "feat(tutor-agent): Whisper voice transcription with graceful fallback"`
+- [ ] **Step 5: Commit** → `git commit -m "feat(tutor-agent): Deepgram voice transcription with graceful fallback"`
 
 ### Task 3.9: Prometheus metrics
 
@@ -734,7 +734,7 @@ def test_iteration_cap_prevents_runaway():
 - Test: `services/tutor-agent/tests/test_metrics.py`
 
 **Interfaces:**
-- Produces: `Instrumentator().instrument(app).expose(app)` (adds `/metrics`) plus custom counters/histograms: `recall_cards_generated_total`, `recall_quizzes_graded_total`, `recall_quiz_correct_total`, `recall_llm_failures_total`, `recall_agent_iterations` (histogram), `recall_whisper_failures_total`.
+- Produces: `Instrumentator().instrument(app).expose(app)` (adds `/metrics`) plus custom counters/histograms: `recall_cards_generated_total`, `recall_quizzes_graded_total`, `recall_quiz_correct_total`, `recall_llm_failures_total`, `recall_agent_iterations` (histogram), `recall_transcription_failures_total`.
 
 - [ ] **Step 1: Failing test** — `GET /metrics` returns 200 and contains `recall_cards_generated_total`.
 - [ ] **Step 2–4: FAIL → implement → PASS**
@@ -914,7 +914,7 @@ Produces: full build/deploy pipeline, Grafana dashboard + alerts, the reusable s
 - §4 Data model (S3 + 3 tables + GSI) → Task 2.1 (storage), Task 6.1 (Terraform). ✅
 - §5 SM-2 → Task 1.1. ✅
 - §6 Data flow (ingest/study/reminder) → Tasks 3.3, 3.6, 6.2 step 5 (SNS CronJob). ✅
-- §7 Error handling (retry/fallback/cap/degradation) → Tasks 3.1 (retry), 3.2 (safe default), 3.4 (cap), 3.5 (fallback), 3.8 (Whisper graceful), 3.3 (bad PDF), 3.6 (MCP unreachable). ✅
+- §7 Error handling (retry/fallback/cap/degradation) → Tasks 3.1 (retry), 3.2 (safe default), 3.4 (cap), 3.5 (fallback), 3.8 (transcription graceful), 3.3 (bad PDF), 3.6 (MCP unreachable). ✅
 - §8 Testing (unit + real-MCP integration + test plan) → Phases 1–3 unit, Task 4.1 integration, Task 7.4 test plan. ✅
 - §9 Observability (metrics/dashboard/alerts) → Tasks 3.9, 7.2. ✅
 - §10 K8s (probes/limits/HPA/secrets/configmaps) → Task 6.2. ✅

@@ -6,7 +6,7 @@ langchain-aws
 langchain-mcp-adapters
 boto3
 pypdf
-openai
+deepgram-sdk
 prometheus-fastapi-instrumentator
 prometheus-client
 pydantic

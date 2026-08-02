@@ -44,7 +44,7 @@ what you don't know and keeps drilling it until you do.*
 - **SM-2** spaced-repetition scheduling (deterministic)
 - **Long-term memory**: a per-learner profile injected into the system prompt
 - Input: **pasted text and PDF upload** (PDF parsed to text, stored in S3)
-- **Whisper voice answers** (OpenAI Whisper API)
+- **Deepgram voice answers** (Deepgram Nova speech-to-text)
 - **Web UI**: upload/paste, flip cards, speak/type answers, progress view
 - **Kubernetes on EC2** (dev + prod namespaces), **Terraform** for all AWS
 - **CI/CD** (tests on every PR, build, ArgoCD deploy dev→prod)
@@ -100,7 +100,7 @@ replies concise and plain-text.
 
 ### 3.2 Invariants (design principles)
 
-1. **The LLM only decides; Python does all I/O.** Every DynamoDB/S3/Whisper/MCP
+1. **The LLM only decides; Python does all I/O.** Every DynamoDB/S3/Deepgram/MCP
    call is code, triggered by a tool the LLM chose. (Mirrors PolyAI's "LLM never
    sees image data" rule.)
 2. **SM-2 math is deterministic and lives outside the LLM.** The Grader produces
@@ -199,7 +199,7 @@ story. **The LLM never performs this math.**
 1. User starts a session; frontend → `POST /session/start {deck_id}`.
 2. tutor-agent reads `LearnerProfile` → injects into system prompt; calls
    `get_due_cards`; presents card front.
-3. User answers by **typing** or **speaking** (voice → Whisper API → text).
+3. User answers by **typing** or **speaking** (voice → Deepgram API → text).
 4. Frontend → `POST /session/answer {card_id, student_answer}`.
 5. Orchestrator calls `grade_answer` → **Grader** returns `{is_correct,
    explanation, quality 0–5}`.
@@ -224,12 +224,12 @@ A scheduled trigger (K8s CronJob or EventBridge) queries cards due today per use
 | Card-Generator returns malformed output | Pydantic-validate; retry once with stricter prompt; else keep the valid cards + warn |
 | Grader returns invalid grade | Validate; **safe-default to "incorrect" (q≈2)** so the card resurfaces; log |
 | Bad PDF (encrypted/scanned/corrupt/oversized) | Caught → "couldn't read this PDF, try pasting text"; enforce max file size |
-| Whisper failure | Non-critical → fall back to "couldn't hear that, please type"; typed path always works |
+| Transcription failure (Deepgram) | Non-critical → fall back to "couldn't hear that, please type"; typed path always works |
 | DynamoDB/S3 error | boto3 retries + clean 5xx with a `request_id`; UI shows "couldn't save, retrying" |
 | No cards due | Friendly state, not an error: "nothing due 🎉 — study ahead?" |
 | MCP server unreachable at startup | Log a warning and run with reduced tools (as PolyAI does), don't crash |
 
-**Cross-cutting:** every external call (LLM, Whisper, boto3, MCP) is wrapped;
+**Cross-cutting:** every external call (LLM, Deepgram, boto3, MCP) is wrapped;
 endpoints return structured `{error, code, request_id}` — never a traceback;
 **graceful-degradation ladder**: voice→text, RAG→direct-read, primary→fallback
 model; `grade_card` writes are idempotent per card.
@@ -272,7 +272,7 @@ coverage; CI green on every PR; coverage reported via Codecov).
 - Request rate, latency p50/p95, error rate per endpoint
 - LLM call latency + failure/fallback count
 - Agent iterations per request + cap-hit count
-- Whisper transcription failure count
+- Transcription failure count (`recall_transcription_failures_total`)
 - Product metrics: cards generated, quizzes graded, quiz accuracy
 - Tool call count + tool error/timeout rate
 
@@ -292,7 +292,7 @@ tool-timeout spike; (optional) sudden accuracy drop signalling a bad prompt/mode
 - **Liveness/readiness probes** on `/health` for each service.
 - **Resource requests/limits** on every pod.
 - **HPA** on tutor-agent (CPU or request-rate based).
-- **Secrets** for LLM + Whisper API keys; **ConfigMaps** for model choice and URLs.
+- **Secrets** for the Deepgram API key (Bedrock uses IAM, not a key); **ConfigMaps** for model choice and URLs.
 - **ArgoCD GitOps** deploys, promoting dev → prod (pattern adapted from PolyAI).
 
 ---
@@ -322,7 +322,7 @@ tool-timeout spike; (optional) sudden accuracy drop signalling a bad prompt/mode
 - **Phase-2 vector store:** pgvector on RDS (simpler/cheaper, recommended) vs.
   OpenSearch.
 - **Phase-2 embeddings:** Bedrock Titan (stays in AWS, no extra key) vs. OpenAI
-  (key already present for Whisper).
+  (Deepgram is speech-only, so an embeddings key would be new either way).
 - ~~**Primary/fallback model pair**~~ — **SETTLED (2026-08-02):**
   primary `bedrock:amazon.nova-lite-v1:0`, fallback
   `bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0`. Both verified to invoke
