@@ -323,4 +323,14 @@ tool-timeout spike; (optional) sudden accuracy drop signalling a bad prompt/mode
   OpenSearch.
 - **Phase-2 embeddings:** Bedrock Titan (stays in AWS, no extra key) vs. OpenAI
   (key already present for Whisper).
-- **Primary/fallback model pair** (e.g. Bedrock Claude → Nova, or → OpenAI).
+- ~~**Primary/fallback model pair**~~ — **SETTLED (2026-08-02):**
+  primary `bedrock:amazon.nova-lite-v1:0`, fallback
+  `bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0`. Both verified to invoke
+  and to support tool calling in account 228281126655. The fallback is a
+  different provider family on purpose, so a Nova-side outage cannot take both
+  down. Note the course IAM policy `bedrock-restrict-developers` **explicitly
+  denies** everything outside an eight-model allowlist — `amazon.nova-2-lite-v1:0`
+  is denied, and `anthropic.claude-3-haiku` (legacy) and
+  `meta.llama3-1-8b-instruct` (needs an inference profile) fail for other
+  reasons. `mistral-7b-instruct` is allowed but returns no tool calls, so it
+  cannot drive the ReAct loop.

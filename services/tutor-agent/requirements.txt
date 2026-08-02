@@ -2,6 +2,7 @@ fastapi
 uvicorn
 langchain
 langchain-core
+langchain-aws
 langchain-mcp-adapters
 boto3
 pypdf
