@@ -14,6 +14,7 @@ import logging
 from pydantic import BaseModel, Field, ValidationError
 
 from llm_json import extract_json, message_text
+from prompts import GRADER_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -28,27 +29,6 @@ _FALLBACK_EXPLANATION = (
     "I could not grade that reliably, so I've kept this card in your review "
     "queue. Let's try it again."
 )
-
-GRADER_PROMPT = """You grade a student's flashcard answer.
-
-You are given the question, the correct answer, and the student's answer. Judge
-whether the student demonstrated recall of the key idea.
-
-Grading scale (SM-2 quality):
-- 5: perfect, immediate recall
-- 4: correct with slight hesitation or imprecise wording
-- 3: correct in substance but incomplete
-- 2: partly right, missed the key idea
-- 1: mostly wrong but shows a trace of recall
-- 0: no answer, or entirely wrong
-
-Judge meaning, not wording — a correct answer phrased differently is still
-correct. Do not reward confident-sounding but wrong answers.
-
-Explain in one or two sentences, addressed to the student, saying *why*.
-
-Reply with JSON only:
-{"is_correct": true, "explanation": "...", "quality": 4}"""
 
 
 class Verdict(BaseModel):

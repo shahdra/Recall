@@ -11,9 +11,13 @@ set -euo pipefail
 ENDPOINT="${DDB_ENDPOINT:-http://localhost:8001}"
 export AWS_REGION="${AWS_REGION:-us-east-1}"
 
-# DynamoDB Local ignores credentials but boto3/CLI still require them to be set.
+# DynamoDB Local keeps a SEPARATE database per access key, so these must match
+# what scripts/start-local.sh uses. Mismatched keys are silent: the tables appear
+# to be created, then the services see an empty database, reads return nothing,
+# and writes fail against non-existent tables.
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-local}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-local}"
+echo "Using access key '$AWS_ACCESS_KEY_ID' (start-local.sh must match)"
 
 create() {
   local name=$1; shift

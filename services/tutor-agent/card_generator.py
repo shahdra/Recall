@@ -15,6 +15,7 @@ import logging
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from llm_json import extract_json, message_text
+from prompts import CARD_GEN_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -40,18 +41,6 @@ class Card(BaseModel):
             raise ValueError("must not be blank")
         return value
 
-
-CARD_GEN_PROMPT = """You write flashcards for a student.
-
-Given study material, produce clear question/answer flashcards. Rules:
-- One fact per card. Keep the front a single question.
-- The back is the answer, not an essay. One or two sentences.
-- Tag each card with a short lowercase `topic` drawn from the material.
-- Never invent facts absent from the material.
-- Produce at most {max_cards} cards.
-
-Reply with JSON only, in exactly this shape:
-{{"cards": [{{"front": "...", "back": "...", "topic": "..."}}]}}"""
 
 _RETRY_SUFFIX = """
 

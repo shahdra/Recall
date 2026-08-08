@@ -34,6 +34,7 @@ from card_generator import generate_cards
 from grader import grade_answer
 from ingest import IngestError, extract_text
 from llm import build_llm
+from prompts import build_system_prompt
 from voice import VoiceUnavailable, build_client, transcribe
 
 logging.basicConfig(
@@ -50,17 +51,6 @@ STUDY_MCP_URL = os.environ.get("STUDY_MCP_URL", "http://study-mcp:9000/mcp")
 LLM = None
 MCP_TOOLS: dict = {}
 VOICE_CLIENT = None
-
-# Task 3.7 replaces this with prompts.py plus learner-profile injection.
-ORCHESTRATOR_PROMPT = """You are Recall, a patient and encouraging study tutor.
-
-You quiz students on their own material using spaced repetition. You explain why
-an answer is right or wrong. You never simply hand over answers to homework, and
-you keep replies short and plain — no markdown.
-
-Use your tools to look up what is due, to grade answers, and to check progress.
-Never guess at a student's data: call a tool and read it."""
-
 
 def _s3_client():
     return boto3.client("s3", region_name=AWS_REGION)
@@ -216,12 +206,26 @@ def _require_tool(name: str):
     return tool_obj
 
 
+class ToolCallFailed(Exception):
+    """A study-mcp tool reported a failure in its result rather than raising."""
+
+
+_TOOL_ERROR_PREFIX = "Error calling tool"
+
+
 def _unwrap_tool_result(raw):
     """Normalize an MCP tool result into a Python object.
 
     MCP returns content blocks — ``[{"type": "text", "text": "{...}"}]`` — rather
     than a bare value, so unwrap the text block and parse it. Plain dicts and JSON
     strings are passed through so fakes and future adapters both work.
+
+    Raises:
+        ToolCallFailed: If the tool reported an error. FastMCP surfaces failures
+            as a *successful* response whose text begins "Error calling tool",
+            so a tolerant parser silently turns a failed write into an empty
+            dict. That made /decks answer ``card_count: 15`` while every write
+            had failed — the API claiming success for work that never happened.
     """
     import json
 
@@ -239,6 +243,8 @@ def _unwrap_tool_result(raw):
         raw = "\n".join(texts)
 
     if isinstance(raw, str):
+        if raw.startswith(_TOOL_ERROR_PREFIX):
+            raise ToolCallFailed(raw[:300])
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, ValueError):
@@ -257,6 +263,9 @@ async def _call_tool(name: str, **kwargs) -> dict:
     tool_obj = _require_tool(name)
     try:
         raw = await tool_obj.ainvoke(kwargs)
+        return _unwrap_tool_result(raw)
+    except ApiError:
+        raise
     except Exception as exc:
         logger.exception("study-mcp tool %s failed", name)
         raise ApiError(
@@ -264,7 +273,50 @@ async def _call_tool(name: str, **kwargs) -> dict:
             status_code=502,
             code="mcp_error",
         ) from exc
-    return _unwrap_tool_result(raw)
+
+
+async def _load_profile(user_id: str) -> dict:
+    """Read a learner's profile, tolerating an unavailable study service.
+
+    Personalization is worth degrading for: a tutor with no memory still tutors,
+    so a missing profile returns ``{}`` rather than failing the turn.
+    """
+    if "get_profile" not in MCP_TOOLS:
+        return {}
+    try:
+        return await _call_tool("get_profile", user_id=user_id)
+    except Exception:
+        logger.warning("could not load learner profile for %s", user_id, exc_info=True)
+        return {}
+
+
+async def _refresh_profile_memory(user_id: str) -> None:
+    """Recompute the learner's weak topics and stats from their review history.
+
+    This is the write half of long-term memory: ``/chat`` reads the profile into
+    the system prompt, and every graded answer updates it, so the tutor's picture
+    of a student improves across sessions.
+
+    Derived from ``get_progress`` — which computes from card history — rather than
+    from incremented counters, so the profile cannot drift away from the reviews
+    that produced it. Failures are swallowed: the learner's answer is already
+    graded and scheduled, and losing a memory refresh must not undo that.
+    """
+    if "get_progress" not in MCP_TOOLS or "update_profile" not in MCP_TOOLS:
+        return
+    try:
+        progress = await _call_tool("get_progress", user_id=user_id)
+        await _call_tool(
+            "update_profile",
+            user_id=user_id,
+            weak_topics=progress.get("weak_topics", {}),
+            stats={
+                "total_reviews": progress.get("total_reviews", 0),
+                "accuracy": progress.get("accuracy", 0.0),
+            },
+        )
+    except Exception:
+        logger.warning("could not refresh profile memory for %s", user_id, exc_info=True)
 
 
 def _decode_b64(value: str, what: str) -> bytes:
@@ -417,6 +469,8 @@ async def session_answer(request: AnswerRequest):
         quality=verdict["quality"],
     )
 
+    await _refresh_profile_memory(request.user_id)
+
     return {
         "is_correct": verdict["is_correct"],
         "explanation": verdict["explanation"],
@@ -428,10 +482,16 @@ async def session_answer(request: AnswerRequest):
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    """Free-form tutoring turn, run through the orchestrator's ReAct loop."""
+    """Free-form tutoring turn, run through the orchestrator's ReAct loop.
+
+    Reads the learner's stored profile first and folds it into the system prompt,
+    so the tutor arrives already knowing what this student struggles with.
+    """
     tools = {**SUB_AGENT_TOOLS, **MCP_TOOLS}
+    profile = await _load_profile(request.user_id)
+
     messages = [
-        {"role": "system", "content": ORCHESTRATOR_PROMPT},
+        {"role": "system", "content": build_system_prompt(profile)},
         {"role": "user", "content": f"[user_id: {request.user_id}] {request.message}"},
     ]
 

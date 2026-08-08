@@ -347,6 +347,89 @@ def test_chat_exposes_tools_to_the_model(client, monkeypatch):
     assert "grade_answer" in bound
 
 
+def test_chat_injects_the_learner_profile_into_the_system_prompt(client, monkeypatch):
+    """Long-term memory: what the tutor learned last session must reach this one."""
+    client.mcp_tools["get_profile"]._result = {
+        "user_id": "u1",
+        "weak_topics": {"mitosis": 0.8},
+        "preferences": {},
+        "stats": {},
+        "notes": "confuses mitosis with meiosis",
+    }
+    llm = FakeLLM([FakeMessage(content="ok")])
+    monkeypatch.setattr(app_module, "LLM", llm)
+
+    client.post("/chat", json={"user_id": "u1", "message": "quiz me"})
+
+    system_prompt = llm.received[0][0]["content"]
+    assert "mitosis" in system_prompt
+    assert "confuses mitosis with meiosis" in system_prompt
+
+
+def test_chat_survives_an_unavailable_profile(client, monkeypatch):
+    """A tutor with no memory still tutors."""
+    tools = dict(client.mcp_tools)
+    tools.pop("get_profile")
+    monkeypatch.setattr(app_module, "MCP_TOOLS", tools)
+    monkeypatch.setattr(app_module, "LLM", FakeLLM([FakeMessage(content="still here")]))
+
+    response = client.post("/chat", json={"user_id": "u1", "message": "hi"})
+    assert response.status_code == 200
+    assert response.json()["response"] == "still here"
+
+
+def test_answer_refreshes_profile_memory(client, monkeypatch):
+    """The write half of memory: grading an answer updates the profile."""
+    monkeypatch.setattr(
+        app_module,
+        "grade_answer",
+        lambda q, a, s, llm: {"is_correct": False, "explanation": "no", "quality": 1},
+    )
+    client.post(
+        "/session/answer",
+        json={
+            "user_id": "u1",
+            "deck_id": "d1",
+            "card_id": "c1",
+            "card_front": "Q",
+            "card_back": "A",
+            "student_answer": "wrong",
+        },
+    )
+    updates = client.mcp_tools["update_profile"].calls
+    assert len(updates) == 1
+    assert updates[0]["weak_topics"] == {"bio": 0.5}
+    assert updates[0]["stats"]["total_reviews"] == 4
+
+
+def test_answer_still_succeeds_if_memory_refresh_fails(client, monkeypatch):
+    """A failed memory write must not undo an already-graded answer."""
+    monkeypatch.setattr(
+        app_module,
+        "grade_answer",
+        lambda q, a, s, llm: {"is_correct": True, "explanation": "yes", "quality": 5},
+    )
+
+    async def boom(args):
+        raise RuntimeError("dynamo down")
+
+    client.mcp_tools["update_profile"].ainvoke = boom
+
+    response = client.post(
+        "/session/answer",
+        json={
+            "user_id": "u1",
+            "deck_id": "d1",
+            "card_id": "c1",
+            "card_front": "Q",
+            "card_back": "A",
+            "student_answer": "A",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["is_correct"] is True
+
+
 def test_chat_reports_llm_failure_gracefully(client, monkeypatch):
     monkeypatch.setattr(app_module, "LLM", FakeLLM([RuntimeError("bedrock down")]))
     response = client.post("/chat", json={"user_id": "u1", "message": "hi"})
@@ -407,3 +490,40 @@ def test_missing_mcp_tool_is_reported_not_crashed(client, monkeypatch):
     response = client.post("/session/start", json={"user_id": "u1"})
     assert response.status_code == 503
     assert "error" in response.json()
+
+
+def test_mcp_tool_error_text_is_not_treated_as_success(client):
+    """FastMCP reports tool failures as a *successful* response whose text is
+    "Error calling tool '...': ...". Parsing that as an empty dict made /decks
+    report card_count: 15 while every write had actually failed — the API
+    claiming success for work that never happened.
+    """
+
+    async def failing(args):
+        return [
+            {
+                "type": "text",
+                "text": (
+                    "Error calling tool 'create_deck': An error occurred "
+                    "(ResourceNotFoundException) when calling the PutItem "
+                    "operation: Cannot do operations on a non-existent table"
+                ),
+            }
+        ]
+
+    client.mcp_tools["create_deck"].ainvoke = failing
+
+    response = client.post(
+        "/decks", json={"user_id": "u1", "title": "T", "text": "material"}
+    )
+    assert response.status_code == 502
+    body = response.json()
+    assert body["code"] == "mcp_error"
+
+
+def test_tool_error_detection_is_case_and_prefix_specific(client):
+    """A card whose legitimate content mentions an error must not trip the check."""
+    from app import _unwrap_tool_result
+
+    legit = [{"type": "text", "text": '{"front":"What is an Error calling tool?"}'}]
+    assert _unwrap_tool_result(legit) == {"front": "What is an Error calling tool?"}
