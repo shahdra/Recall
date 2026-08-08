@@ -27,8 +27,10 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from langchain_core.tools import tool
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 
+import metrics
 from agent_loop import arun_agent
 from card_generator import generate_cards
 from grader import grade_answer
@@ -153,6 +155,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Adds /metrics plus request rate, latency, and error-rate series per endpoint.
+Instrumentator().instrument(app).expose(app, include_in_schema=False)
+
+# Tracks how much of the model's own failure tally has been forwarded to
+# Prometheus, since counters can only be incremented by a delta.
+_LLM_COUNTER_STATE: dict = {}
 
 
 # --- error handling -----------------------------------------------------------
@@ -413,8 +422,13 @@ async def create_deck(request: DeckRequest):
         source_s3_key=source_s3_key,
     )
     deck_id = deck.get("deck_id")
+    metrics.decks_created.inc()
 
     cards = generate_cards(material, LLM)
+    metrics.sync_llm_counters(LLM, _LLM_COUNTER_STATE)
+    if cards:
+        metrics.cards_generated.inc(len(cards))
+
     for card in cards:
         await _call_tool(
             "add_card",
@@ -461,6 +475,10 @@ async def session_answer(request: AnswerRequest):
     verdict = grade_answer(
         request.card_front, request.card_back, request.student_answer, LLM
     )
+    metrics.sync_llm_counters(LLM, _LLM_COUNTER_STATE)
+    metrics.quizzes_graded.inc()
+    if verdict["is_correct"]:
+        metrics.quiz_correct.inc()
 
     schedule = await _call_tool(
         "grade_card",
@@ -496,6 +514,8 @@ async def chat(request: ChatRequest):
     ]
 
     result = await arun_agent(messages, LLM, tools)
+    metrics.record_agent_run(result)
+    metrics.sync_llm_counters(LLM, _LLM_COUNTER_STATE)
 
     return {
         "response": result["response"],
@@ -520,6 +540,7 @@ async def transcribe_audio(request: TranscribeRequest):
     text = transcribe(audio, VOICE_CLIENT)
     response = {"text": text}
     if not text:
+        metrics.transcription_failures.inc()
         response["message"] = "I couldn't make that out — please type your answer."
     return response
 
