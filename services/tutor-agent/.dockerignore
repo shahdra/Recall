@@ -1,0 +1,10 @@
+.venv/
+tests/
+pytest.ini
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+# Never bake local secrets into an image.
+.env
+.env.*
