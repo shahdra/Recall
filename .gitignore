@@ -39,6 +39,7 @@ htmlcov/
 node_modules/
 .next/
 out/
+*.tsbuildinfo
 
 # Editors & OS
 .DS_Store

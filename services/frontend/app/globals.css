@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 210 40% 98%;
+    --foreground: 222.2 84% 4.9%;
+    --card: 0 0% 100%;
+    --muted: 210 40% 94%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+    --border: 214.3 31.8% 88%;
+    --primary: 243 75% 59%;
+    --primary-foreground: 210 40% 98%;
+    /* Grading colors. Chosen to stay distinguishable in the most common form of
+       color blindness, where a pure red/green pair does not: the "correct" hue
+       is shifted toward teal and the two differ in lightness as well as hue. */
+    --success: 160 84% 39%;
+    --success-foreground: 0 0% 100%;
+    --danger: 0 72% 51%;
+    --danger-foreground: 0 0% 100%;
+    --radius: 0.75rem;
+  }
+  .dark {
+    --background: 222.2 84% 4.9%;
+    --foreground: 210 40% 98%;
+    --card: 217.2 32.6% 12%;
+    --muted: 217.2 32.6% 17.5%;
+    --muted-foreground: 215 20.2% 65.1%;
+    --border: 217.2 32.6% 22%;
+    --primary: 243 75% 68%;
+    --primary-foreground: 222.2 47.4% 11.2%;
+    --success: 160 74% 45%;
+    --success-foreground: 0 0% 100%;
+    --danger: 0 72% 60%;
+    --danger-foreground: 0 0% 100%;
+  }
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+@layer utilities {
+  /* The flip animation for revealing a card's answer. */
+  .preserve-3d {
+    transform-style: preserve-3d;
+  }
+  .backface-hidden {
+    backface-visibility: hidden;
+  }
+  .rotate-y-180 {
+    transform: rotateY(180deg);
+  }
+}
