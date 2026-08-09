@@ -5,7 +5,7 @@ so these tests pin down the behavior we would otherwise be trusting a framework
 for: tool routing, the iteration cap, and what happens when a tool explodes.
 """
 
-from conftest import FakeLLM, FakeMessage
+from fakes import FakeLLM, FakeMessage
 
 from agent_loop import arun_agent
 

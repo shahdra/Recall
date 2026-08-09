@@ -1,4 +1,4 @@
-from conftest import FakeLLM
+from fakes import FakeLLM
 
 from grader import DEFAULT_FAIL_QUALITY, grade_answer
 

@@ -1,4 +1,4 @@
-from conftest import FakeLLM
+from fakes import FakeLLM
 
 from card_generator import generate_cards
 

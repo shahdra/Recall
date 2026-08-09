@@ -6,7 +6,8 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  unit:
+    name: unit (${{ matrix.service }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -24,22 +25,123 @@ jobs:
       - name: Install dependencies
         run: pip install -r services/${{ matrix.service }}/requirements.txt
 
+      # No AWS credentials and no DEEPGRAM_API_KEY here on purpose: the unit
+      # suite must pass with every external service absent.
       - name: Run unit tests
         working-directory: services/${{ matrix.service }}
-        run: pytest -v -m "not integration" --junitxml=results.xml
+        run: >-
+          pytest -v -m "not integration"
+          --junitxml=results.xml
+          --cov=. --cov-report=xml --cov-report=term
 
-      - name: Test summary
+      - name: Summarize results
         if: always()
+        working-directory: services/${{ matrix.service }}
         run: |
-          echo "### ${{ matrix.service }} unit tests" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f services/${{ matrix.service }}/results.xml ]; then
-            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
-          import glob, xml.etree.ElementTree as ET
-          for path in glob.glob("services/*/results.xml"):
-              suite = ET.parse(path).getroot().find("testsuite") or ET.parse(path).getroot()
-              print(f"- tests: {suite.get('tests')} | failures: {suite.get('failures')} "
-                    f"| errors: {suite.get('errors')} | skipped: {suite.get('skipped')}")
+          {
+            echo "### ${{ matrix.service }} — unit tests"
+            if [ -f results.xml ]; then
+              python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("results.xml").getroot()
+          suite = root.find("testsuite") or root
+          total = int(suite.get("tests", 0))
+          failures = int(suite.get("failures", 0))
+          errors = int(suite.get("errors", 0))
+          skipped = int(suite.get("skipped", 0))
+          passed = total - failures - errors - skipped
+          mark = "✅" if failures == 0 and errors == 0 else "❌"
+          print(f"{mark} {passed}/{total} passed "
+                f"(failures: {failures}, errors: {errors}, skipped: {skipped})")
           PY
-          else
-            echo "- no results file produced" >> "$GITHUB_STEP_SUMMARY"
-          fi
+            else
+              echo "❌ no results file produced"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: services/${{ matrix.service }}/coverage.xml
+          flags: ${{ matrix.service }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  integration:
+    name: integration (real MCP transport)
+    runs-on: ubuntu-latest
+    # Runs against a real study-mcp subprocess over MCP-over-HTTP, backed by
+    # DynamoDB Local. Nothing is mocked except the LLM.
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local
+        ports:
+          - 8001:8000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # One environment holds both services' dependencies: the test fixture
+      # launches study-mcp with the current interpreter when it finds no
+      # service-local venv, so fastmcp has to be importable here too.
+      - name: Install dependencies for both services
+        run: |
+          pip install -r services/study-mcp/requirements.txt
+          pip install -r services/tutor-agent/requirements.txt
+
+      - name: Wait for DynamoDB Local
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -s -o /dev/null http://localhost:8001; then
+              echo "DynamoDB Local is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "DynamoDB Local never became reachable" >&2
+          exit 1
+
+      - name: Run integration tests
+        working-directory: services/tutor-agent
+        env:
+          RECALL_TEST_DDB_ENDPOINT: http://localhost:8001
+          # The fixture launches study-mcp from this directory; it needs the
+          # sibling service importable.
+          PYTHONPATH: ${{ github.workspace }}/services/study-mcp
+        run: >-
+          pytest tests/integration/test_mcp_roundtrip.py -v -m integration
+          --junitxml=integration-results.xml
+
+      - name: Summarize results
+        if: always()
+        working-directory: services/tutor-agent
+        run: |
+          {
+            echo "### Integration — agent ↔ study-mcp over real MCP"
+            if [ -f integration-results.xml ]; then
+              python - <<'PY'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("integration-results.xml").getroot()
+          suite = root.find("testsuite") or root
+          total = int(suite.get("tests", 0))
+          failures = int(suite.get("failures", 0))
+          errors = int(suite.get("errors", 0))
+          skipped = int(suite.get("skipped", 0))
+          passed = total - failures - errors - skipped
+          mark = "✅" if failures == 0 and errors == 0 else "❌"
+          print(f"{mark} {passed}/{total} passed "
+                f"(failures: {failures}, errors: {errors}, skipped: {skipped})")
+          if skipped == total and total:
+              print("⚠️ every test skipped — DynamoDB Local was probably unreachable")
+          PY
+            else
+              echo "❌ no results file produced"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

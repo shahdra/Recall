@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from moto import mock_aws
 
 import app as app_module
-from conftest import FakeLLM, FakeMessage
+from fakes import FakeLLM, FakeMessage
 
 # --- health -------------------------------------------------------------------
 

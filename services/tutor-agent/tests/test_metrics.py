@@ -136,7 +136,7 @@ def test_accuracy_is_derivable_from_the_two_counters(client, monkeypatch):
 
 
 def test_agent_iterations_histogram_observes_chat_turns(client, monkeypatch):
-    from conftest import FakeLLM, FakeMessage
+    from fakes import FakeLLM, FakeMessage
 
     monkeypatch.setattr(app_module, "LLM", FakeLLM([FakeMessage(content="done")]))
     before = metrics_module.read_histogram_count("recall_agent_iterations")
@@ -145,7 +145,7 @@ def test_agent_iterations_histogram_observes_chat_turns(client, monkeypatch):
 
 
 def test_capped_agent_run_is_counted(client, monkeypatch):
-    from conftest import FakeLLM, FakeMessage
+    from fakes import FakeLLM, FakeMessage
 
     # A model that only ever asks for tools drives the loop into its cap.
     monkeypatch.setattr(
@@ -159,7 +159,7 @@ def test_capped_agent_run_is_counted(client, monkeypatch):
 
 
 def test_llm_failure_is_counted(client, monkeypatch):
-    from conftest import FakeLLM
+    from fakes import FakeLLM
 
     monkeypatch.setattr(app_module, "LLM", FakeLLM([RuntimeError("bedrock down")]))
     before = metrics_module.read_counter("recall_llm_failures_total")
@@ -184,7 +184,7 @@ def test_successful_transcription_is_not_counted_as_failure(client, monkeypatch)
 
 
 def test_tool_errors_are_counted(client, monkeypatch):
-    from conftest import FakeLLM, FakeMessage
+    from fakes import FakeLLM, FakeMessage
 
     monkeypatch.setattr(
         app_module,

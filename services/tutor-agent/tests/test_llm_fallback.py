@@ -8,7 +8,7 @@ fire in the very situation it exists for.
 
 import pytest
 
-from conftest import FakeMessage
+from fakes import FakeMessage
 from llm import FallbackChatModel
 
 
