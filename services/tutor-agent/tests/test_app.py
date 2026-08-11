@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from moto import mock_aws
 
 import app as app_module
-from fakes import FakeLLM, FakeMessage
+from fakes import FakeLLM, FakeMCPTool, FakeMessage
 
 # --- health -------------------------------------------------------------------
 
@@ -30,6 +30,88 @@ def test_health_reports_dependency_state(client):
     body = client.get("/health").json()
     assert "mcp_tools" in body
     assert body["mcp_tools"] >= 4
+
+
+# --- demo clock ---------------------------------------------------------------
+#
+# The default tool registry has no clock tools, mirroring a production study-mcp
+# started without RECALL_DEMO_MODE. That is what makes "off" the default here.
+
+
+def test_health_reports_demo_mode_off_without_the_tools(client):
+    body = client.get("/health").json()
+    assert body["demo_mode"] is False
+    assert body["simulated_date"] is None
+
+
+def test_advance_clock_is_404_without_demo_mode(client):
+    """A build with the tool absent must refuse, not silently no-op."""
+    response = client.post("/demo/advance-clock", json={"days": 1})
+    assert response.status_code == 404
+    assert response.json()["code"] == "demo_disabled"
+
+
+def test_reset_clock_is_404_without_demo_mode(client):
+    assert client.post("/demo/reset-clock").status_code == 404
+
+
+def _add_clock_tools(client, monkeypatch):
+    """Register fake clock tools, as a demo-mode study-mcp would expose."""
+    state = {"offset": 0}
+
+    def advance(args):
+        state["offset"] += args.get("days", 1)
+        return {
+            "demo_mode": True,
+            "offset_days": state["offset"],
+            "simulated_date": f"2026-08-{10 + state['offset']:02d}",
+            "real_date": "2026-08-10",
+        }
+
+    def reset(args):
+        state["offset"] = 0
+        return {
+            "demo_mode": True,
+            "offset_days": 0,
+            "simulated_date": "2026-08-10",
+            "real_date": "2026-08-10",
+        }
+
+    tools = dict(client.mcp_tools)
+    tools["advance_clock"] = FakeMCPTool("advance_clock", advance)
+    tools["reset_clock"] = FakeMCPTool("reset_clock", reset)
+    tools["get_clock"] = FakeMCPTool("get_clock", lambda args: reset(args))
+    monkeypatch.setattr(app_module, "MCP_TOOLS", tools)
+    return state
+
+
+def test_health_reports_demo_mode_when_the_tools_exist(client, monkeypatch):
+    _add_clock_tools(client, monkeypatch)
+    body = client.get("/health").json()
+    assert body["demo_mode"] is True
+    assert body["simulated_date"] == "2026-08-10"
+
+
+def test_advance_clock_passes_through_and_accumulates(client, monkeypatch):
+    _add_clock_tools(client, monkeypatch)
+    first = client.post("/demo/advance-clock", json={"days": 1}).json()
+    assert first["offset_days"] == 1
+    second = client.post("/demo/advance-clock", json={"days": 1}).json()
+    assert second["offset_days"] == 2
+    assert second["simulated_date"] == "2026-08-12"
+
+
+def test_advance_clock_defaults_to_one_day(client, monkeypatch):
+    _add_clock_tools(client, monkeypatch)
+    body = client.post("/demo/advance-clock", json={}).json()
+    assert body["offset_days"] == 1
+
+
+def test_reset_clock_passes_through(client, monkeypatch):
+    _add_clock_tools(client, monkeypatch)
+    client.post("/demo/advance-clock", json={"days": 5})
+    body = client.post("/demo/reset-clock").json()
+    assert body["offset_days"] == 0
 
 
 # --- POST /decks --------------------------------------------------------------

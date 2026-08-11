@@ -24,6 +24,24 @@ import storage
 MAX_QUALITY = 5
 MIN_QUALITY = 0
 
+DEMO_MODE = os.environ.get("RECALL_DEMO_MODE", "").lower() in ("1", "true", "yes")
+"""Enables the clock controls below, which let a demo skip the days a real
+spaced-repetition schedule would take to play out.
+
+Off unless explicitly switched on, so production gets the real clock simply by
+not setting the variable. The gate lives in the tools themselves rather than only
+in the UI: this shifts time for *every* user of the process, which is fine for a
+laptop demo and wrong anywhere shared.
+"""
+
+MAX_CLOCK_ADVANCE_DAYS = 365
+"""Cap on a single advance. Guards against a fat-fingered 100000 pushing every
+card so far out that the demo database is effectively unusable."""
+
+_clock_offset_days = 0
+"""Days the simulated date runs ahead of the real one. In-memory on purpose: a
+restart returns to real time, so a forgotten demo cannot skew things forever."""
+
 mcp = FastMCP("study-mcp")
 
 
@@ -77,7 +95,51 @@ TABLES = _LazyTables()
 
 
 def _today_iso() -> str:
-    return date.today().isoformat()
+    """Today, or the simulated date when a demo has advanced the clock.
+
+    Every date in the service resolves through here — due-card queries, new
+    cards, grade scheduling, review timestamps — so one offset moves all of them
+    together and the schedule stays internally consistent.
+    """
+    return (date.today() + timedelta(days=_clock_offset_days)).isoformat()
+
+
+def _clock_state() -> dict:
+    """The clock's current state, shared by both demo tools and the health route."""
+    return {
+        "demo_mode": DEMO_MODE,
+        "offset_days": _clock_offset_days,
+        "simulated_date": _today_iso(),
+        "real_date": date.today().isoformat(),
+    }
+
+
+def _advance_clock(days: int = 1) -> dict:
+    """Move the simulated date forward by whole days."""
+    global _clock_offset_days
+    if not DEMO_MODE:
+        # An error payload rather than an exception: a disabled backdoor should
+        # be inert and legible, not a 500 that looks like a broken service.
+        return {"error": "demo mode is disabled", **_clock_state()}
+    days = int(days)
+    # Rewinding is reset_clock's job. A negative offset would make already-graded
+    # cards un-due and read as the scheduler losing reviews.
+    if days < 1 or days > MAX_CLOCK_ADVANCE_DAYS:
+        return {
+            "error": f"days must be between 1 and {MAX_CLOCK_ADVANCE_DAYS}",
+            **_clock_state(),
+        }
+    _clock_offset_days += days
+    return _clock_state()
+
+
+def _reset_clock() -> dict:
+    """Return to the real date so a demo can be re-run from a clean slate."""
+    global _clock_offset_days
+    if not DEMO_MODE:
+        return {"error": "demo mode is disabled", **_clock_state()}
+    _clock_offset_days = 0
+    return _clock_state()
 
 
 def _plus_days(days: int) -> str:
@@ -220,7 +282,7 @@ def _update_profile(user_id: str, notes=None, weak_topics=None, preferences=None
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> JSONResponse:
     """Liveness/readiness probe for Kubernetes."""
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status": "ok", "clock": _clock_state()})
 
 
 @mcp.tool
@@ -275,6 +337,36 @@ def update_profile(
 ) -> dict:
     """Update a learner's long-term profile. Only the fields given are changed."""
     return _update_profile(user_id, notes, weak_topics, preferences, stats)
+
+
+# --- Demo-only clock controls -------------------------------------------------
+#
+# Registered only when RECALL_DEMO_MODE is set, so in production these tools do
+# not exist: the agent never discovers them, the LLM cannot be talked into
+# calling one, and the tutor-agent reports demo_mode=false because the tool is
+# absent. The gate inside _advance_clock/_reset_clock is the second layer, for
+# the case where the tools are registered but the flag is later read as false.
+if DEMO_MODE:
+
+    @mcp.tool
+    def advance_clock(days: int = 1) -> dict:
+        """Move the simulated date forward (demo only).
+
+        Skips the wait a spaced-repetition schedule needs to become visible:
+        advancing past a card's due date makes it genuinely due, via the same
+        query the real clock drives.
+        """
+        return _advance_clock(days)
+
+    @mcp.tool
+    def reset_clock() -> dict:
+        """Return the simulated date to the real one (demo only)."""
+        return _reset_clock()
+
+    @mcp.tool
+    def get_clock() -> dict:
+        """Read the simulated date without changing it (demo only)."""
+        return _clock_state()
 
 
 if __name__ == "__main__":

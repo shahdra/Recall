@@ -351,6 +351,12 @@ class SessionStartRequest(BaseModel):
     deck_id: str | None = None
 
 
+class AdvanceClockRequest(BaseModel):
+    """Demo only. Days to skip forward, so a schedule can be shown playing out."""
+
+    days: int = 1
+
+
 class AnswerRequest(BaseModel):
     user_id: str
     deck_id: str
@@ -375,12 +381,33 @@ class TranscribeRequest(BaseModel):
 @app.get("/health")
 async def health():
     """Liveness/readiness probe. Reports dependency state for debugging."""
+    # Demo mode is inferred from study-mcp having registered the tool rather than
+    # read from our own environment: one source of truth, so the button cannot
+    # appear against a server that would refuse it.
+    demo_mode = "advance_clock" in MCP_TOOLS
     return {
         "status": "ok",
         "llm": LLM is not None,
         "mcp_tools": len(MCP_TOOLS),
         "voice": VOICE_CLIENT is not None,
+        "demo_mode": demo_mode,
+        "simulated_date": (await _clock_state()).get("simulated_date") if demo_mode else None,
     }
+
+
+async def _clock_state() -> dict:
+    """study-mcp's clock, or ``{}`` if it cannot be read.
+
+    Health must stay answerable even when the demo tool misbehaves — a probe that
+    500s over a demo affordance would take the service out of rotation.
+    """
+    if "get_clock" not in MCP_TOOLS:
+        return {}
+    try:
+        return await _call_tool("get_clock")
+    except Exception:
+        logger.warning("could not read the demo clock", exc_info=True)
+        return {}
 
 
 @app.post("/decks")
@@ -496,6 +523,27 @@ async def session_answer(request: AnswerRequest):
         "interval_days": schedule.get("interval_days"),
         "due_date": schedule.get("due_date"),
     }
+
+
+@app.post("/demo/advance-clock")
+async def demo_advance_clock(request: AdvanceClockRequest):
+    """Skip the simulated date forward so a schedule can be demonstrated.
+
+    Thin passthrough: study-mcp owns the clock and enforces the demo gate, so a
+    build with demo mode off has no ``advance_clock`` tool and this returns 404
+    rather than silently doing nothing.
+    """
+    if "advance_clock" not in MCP_TOOLS:
+        raise ApiError("Demo mode is disabled.", status_code=404, code="demo_disabled")
+    return await _call_tool("advance_clock", days=request.days)
+
+
+@app.post("/demo/reset-clock")
+async def demo_reset_clock():
+    """Return the simulated date to the real one, to re-run a demo cleanly."""
+    if "reset_clock" not in MCP_TOOLS:
+        raise ApiError("Demo mode is disabled.", status_code=404, code="demo_disabled")
+    return await _call_tool("reset_clock")
 
 
 @app.post("/chat")

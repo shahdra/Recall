@@ -1,7 +1,9 @@
 import type {
   ApiErrorBody,
+  ClockState,
   CreateDeckResponse,
   GradeResponse,
+  HealthResponse,
   SessionStartResponse,
   TranscribeResponse,
 } from "./types";
@@ -105,4 +107,29 @@ export function submitAnswer(
 
 export function transcribe(audioB64: string): Promise<TranscribeResponse> {
   return post<TranscribeResponse>("/transcribe", { audio_b64: audioB64 });
+}
+
+/**
+ * Read the agent's health, used to decide whether the demo clock exists.
+ *
+ * Never throws: a missing or unreachable health route means "no demo mode",
+ * which is the safe reading — the control simply stays hidden rather than the
+ * study screen failing over an optional affordance.
+ */
+export async function getHealth(): Promise<HealthResponse | null> {
+  try {
+    const response = await fetch(`${resolveAgentUrl()}/health`);
+    if (!response.ok) return null;
+    return (await response.json()) as HealthResponse;
+  } catch {
+    return null;
+  }
+}
+
+export function advanceClock(days = 1): Promise<ClockState> {
+  return post<ClockState>("/demo/advance-clock", { days });
+}
+
+export function resetClock(): Promise<ClockState> {
+  return post<ClockState>("/demo/reset-clock", {});
 }

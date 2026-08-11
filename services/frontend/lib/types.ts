@@ -51,6 +51,25 @@ export interface TranscribeResponse {
   message?: string;
 }
 
+/** What `GET /health` reports. Only the demo fields are used by the UI. */
+export interface HealthResponse {
+  status: string;
+  /** True when study-mcp exposes the clock tools, so the demo control is usable. */
+  demo_mode?: boolean;
+  /** The date study-mcp is currently pretending it is. Null outside demo mode. */
+  simulated_date?: string | null;
+}
+
+/** Returned by the demo clock endpoints. */
+export interface ClockState {
+  demo_mode: boolean;
+  offset_days: number;
+  simulated_date: string;
+  real_date: string;
+  /** Present when the server refused — e.g. demo mode off, or days out of range. */
+  error?: string;
+}
+
 /** The structured error shape every tutor-agent endpoint returns on failure. */
 export interface ApiErrorBody {
   error: string;
