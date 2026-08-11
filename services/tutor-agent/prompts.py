@@ -52,23 +52,117 @@ You have tools for looking up due cards, generating cards from material, grading
 answers, and checking progress. Use them rather than reasoning from memory."""
 
 
-CARD_GEN_PROMPT = """You write flashcards for a student.
+_CARD_GEN_BASE = """You write flashcards that make a student think, not just recall
+definitions.
 
-Given study material, produce clear question/answer flashcards. Rules:
-- One fact per card. Keep the front a single question.
-- The back is the answer, not an essay. One or two sentences.
-- Tag each card with a short lowercase `topic` drawn from the material.
-- Never invent facts absent from the material.
+Write three kinds of card, in these proportions. Of {max_cards} cards, roughly
+{recall_count} should be recall, {applied_count} applied, and
+{diagnostic_count} diagnostic. Count them as you go — the usual failure is a deck
+of almost all recall cards, which is the one outcome to avoid.
+- Recall: "What is X?", "What does Y do?". These anchor the vocabulary, so keep
+  them — just do not let them take over the deck.
+- Applied: give a small concrete scenario, example, or snippet and ask what
+  happens, which option fits, or why. The student should have to use the idea,
+  not just name it. Vary how you open these; not every one should start with
+  "You".
+- Diagnostic: state something subtly wrong, or show a flawed example, and ask the
+  student to find and correct the mistake. Say plainly in the front that
+  something is wrong, so it reads as a challenge and not as a fact to memorize.
+  Never leave a false statement where it could be mistaken for the answer.
+
+Rules:
+- The front is self-contained: include any scenario or example the student needs.
+  It may be a few sentences when the card sets up a situation.
+- The back gives the answer and, for applied and diagnostic cards, one short
+  sentence of why. Two or three sentences at most.
+- For a diagnostic card, the back must state the correction explicitly, so the
+  student ends up remembering the true version rather than the flawed one.
+- Test understanding, never trivia. Skip anything answerable by matching a word
+  in the question.
+- Tag each card with a short lowercase `topic`. Use several specific topics
+  rather than one broad label — the tutor tracks which topics the student is
+  weak at, and a single tag for the whole deck makes that impossible.
 - Produce at most {max_cards} cards.
+{grounding}
+The shape of each kind, so you can build your own from the subject at hand.
+These are patterns to fill in, not sentences to reuse:
+- recall: front asks what a named thing is or does. back defines it in a
+  sentence.
+- applied: front describes a specific situation in the subject — particular
+  values, a short snippet, a concrete case — then asks what results, which
+  choice fits, or why it turns out that way. back gives the outcome plus the
+  one-sentence reason.
+- diagnostic: front asserts that an error is present, then gives the wrong claim.
+  Follow this skeleton, substituting the subject's own content:
+  front "This statement is wrong — what is the mistake? '<a confident claim
+  about the subject that is false in one specific way>'" / back "<what is
+  actually true>, because <reason>."
+  Do not soften this into "is this good practice?" or "is this correct?" — an
+  open question the student can answer by judging is an applied card, not a
+  diagnostic one. The front must commit to there being a mistake and ask what it
+  is, so the student has to locate it rather than deliver a verdict.
 
 Reply with JSON only, in exactly this shape:
 {{"cards": [{{"front": "...", "back": "...", "topic": "..."}}]}}"""
+
+_GROUNDED_RULE = """- Every fact you test must come from the material. Never invent facts absent
+  from it, and do not pad the deck with outside knowledge to reach the maximum.
+- You may still invent the scenarios and flawed statements that applied and
+  diagnostic cards need, as long as judging them depends only on facts the
+  material states. Illustrating the material is not the same as adding to it.
+"""
+"""Applied when the student supplied real material. Their notes are the syllabus,
+so drifting outside them produces cards for an exam they are not sitting.
+
+The second rule exists because the first, alone, reads as a ban on examples: the
+model would only echo sentences back. A scenario the material's own facts settle
+is fair game — what must not be invented is the *fact being tested*."""
+
+_TOPIC_RULE = """- The student named a subject instead of supplying material. Draw on your own
+  knowledge of it and teach the fundamentals a beginner needs.
+- Cover the breadth of the subject, ordered from foundational to advanced.
+- Stick to well-established facts. If a detail is contested or version-specific,
+  leave it out rather than risk drilling the student on something wrong.
+"""
+"""Applied when the student asked to be taught a subject. There is no source text
+to be faithful to, so the model's own knowledge is the material — but nothing
+verifies it, hence the bias toward well-established facts."""
+
+
+def card_gen_prompt(max_cards: int, *, grounded: bool) -> str:
+    """Build the Card-Generator's system prompt.
+
+    Args:
+        max_cards: Upper bound on the deck size.
+        grounded: True when the student supplied study material, so the cards
+            must stay inside it. False when they named a subject to be taught,
+            which licenses the model's own knowledge.
+    """
+    # Spelled out as counts rather than "about a third" each: asked for
+    # proportions, the model produced 69% recall cards. A target it can tally
+    # against as it writes is harder to drift away from.
+    #
+    # The three must sum to exactly max_cards. Clamping each to a minimum of one
+    # instead would make a 2-card deck ask for three cards, and a prompt whose
+    # mix contradicts its own cap is worse than a thin mix.
+    applied = max_cards // 3
+    diagnostic = max_cards // 3
+    recall = max_cards - applied - diagnostic
+    return _CARD_GEN_BASE.format(
+        max_cards=max_cards,
+        recall_count=recall,
+        applied_count=applied,
+        diagnostic_count=diagnostic,
+        grounding=_GROUNDED_RULE if grounded else _TOPIC_RULE,
+    )
+
+
 
 
 GRADER_PROMPT = """You grade a student's flashcard answer.
 
 You are given the question, the correct answer, and the student's answer. Judge
-whether the student demonstrated recall of the key idea.
+whether the student demonstrated understanding of the key idea.
 
 Grading scale (SM-2 quality):
 - 5: perfect, immediate recall
@@ -80,6 +174,15 @@ Grading scale (SM-2 quality):
 
 Judge meaning, not wording — a correct answer phrased differently is still
 correct. Do not reward confident-sounding but wrong answers.
+
+Cards are not all definitions. Some give a scenario and ask what happens or why;
+some state something false and ask the student to find the mistake. For those,
+grade the reasoning:
+- Identifying the right flaw, or reaching the right outcome, counts as correct
+  even when the wording differs entirely from the stored answer.
+- Naming the correct conclusion with clearly wrong reasoning is at most a 2.
+- On a find-the-mistake card, a student who agrees with the false statement is
+  wrong no matter how well they justify it.
 
 Explain in one or two sentences, addressed to the student, saying *why*.
 

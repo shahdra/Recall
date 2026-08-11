@@ -7,10 +7,10 @@ first-time learner (or a corrupt profile) does not break the session.
 """
 
 from prompts import (
-    CARD_GEN_PROMPT,
     GRADER_PROMPT,
     ORCHESTRATOR_PROMPT,
     build_system_prompt,
+    card_gen_prompt,
     summarize_profile,
 )
 
@@ -25,7 +25,12 @@ def test_orchestrator_prompt_defines_persona_and_boundaries():
 
 
 def test_all_three_prompts_are_substantial():
-    for prompt in (ORCHESTRATOR_PROMPT, CARD_GEN_PROMPT, GRADER_PROMPT):
+    for prompt in (
+        ORCHESTRATOR_PROMPT,
+        card_gen_prompt(15, grounded=True),
+        card_gen_prompt(15, grounded=False),
+        GRADER_PROMPT,
+    ):
         assert len(prompt) > 120
 
 
@@ -138,7 +143,150 @@ def test_profile_injection_is_clearly_delimited():
 
 
 def test_card_gen_prompt_accepts_max_cards_substitution():
-    assert "7" in CARD_GEN_PROMPT.format(max_cards=7)
+    assert "7" in card_gen_prompt(7, grounded=True)
+
+
+def test_card_gen_prompt_leaves_the_json_braces_literal():
+    """The JSON example must survive into the prompt, not be eaten by format()."""
+    prompt = card_gen_prompt(7, grounded=True)
+    assert '{"cards": [{"front": "...", "back": "...", "topic": "..."}]}' in prompt
+
+
+def test_card_gen_asks_for_a_mix_of_card_kinds():
+    """A deck of nothing but "What is X?" does not test understanding."""
+    for grounded in (True, False):
+        prompt = card_gen_prompt(30, grounded=grounded).lower()
+        assert "recall" in prompt
+        assert "applied" in prompt
+        assert "diagnostic" in prompt
+
+
+def test_card_gen_shows_an_example_of_each_kind():
+    """Naming the kinds is weaker than describing their shape."""
+    prompt = card_gen_prompt(30, grounded=False)
+    assert "- recall:" in prompt
+    assert "- applied:" in prompt
+    assert "- diagnostic:" in prompt
+
+
+def test_card_gen_states_the_mix_as_counts_not_proportions():
+    """Asked for "about a third", the model returned 69% recall cards."""
+    prompt = card_gen_prompt(30, grounded=True)
+    # 30 cards -> 10 applied, 10 diagnostic, 10 recall.
+    assert "10 should be recall" in prompt
+    assert "10 applied" in prompt
+    assert "10 diagnostic" in prompt
+
+
+def _mix(max_cards: int) -> tuple[int, int, int]:
+    """Read the three requested counts back out of the prompt text."""
+    import re
+
+    counts = re.search(
+        r"roughly\s+(\d+) should be recall, (\d+) applied, and\s+(\d+) diagnostic",
+        card_gen_prompt(max_cards, grounded=True),
+    )
+    assert counts, f"could not read the mix out of the prompt for {max_cards}"
+    recall, applied, diagnostic = (int(n) for n in counts.groups())
+    return recall, applied, diagnostic
+
+
+def test_the_three_counts_sum_to_the_deck_size():
+    """A mix that overshoots max_cards would make the prompt contradict its cap.
+
+    Includes the degenerate sizes: a 1-card deck asking for three cards is the
+    specific bug this pins down.
+    """
+    for max_cards in (1, 2, 3, 4, 5, 7, 15, 20, 40):
+        assert sum(_mix(max_cards)) == max_cards, max_cards
+
+
+def test_real_deck_sizes_ask_for_a_genuine_three_way_split():
+    """The floor case may degrade, but the sizes actually used must not."""
+    for max_cards in (15, 20, 40):
+        recall, applied, diagnostic = _mix(max_cards)
+        for count in (recall, applied, diagnostic):
+            assert count >= max_cards // 4, (max_cards, recall, applied, diagnostic)
+        # Recall must no longer dominate the deck the way it did at 69%.
+        assert recall <= applied + diagnostic
+
+
+def test_card_gen_does_not_hand_over_reusable_example_sentences():
+    """Given full example cards, the model echoed them back nearly verbatim.
+
+    The diagnostic skeleton is the exception: without a concrete form to copy the
+    model produced no diagnostic cards at all, so it keeps a shape — but filled
+    with placeholders rather than real Kubernetes content.
+    """
+    prompt = card_gen_prompt(30, grounded=False)
+    assert "ClusterIP" not in prompt
+    assert "patterns to fill in, not sentences to reuse" in prompt
+
+
+def test_diagnostic_cards_must_assert_the_error_not_ask_for_a_verdict():
+    """Asked only to "show a flawed example", the model wrote "is this good
+    practice?" cards instead — which the student answers by judging, not by
+    locating the mistake. That collapses diagnostic into applied."""
+    for grounded in (True, False):
+        prompt = card_gen_prompt(30, grounded=grounded)
+        assert "is this good practice?" in prompt  # named as the thing to avoid
+        assert "commit to there being a mistake" in prompt
+
+
+def test_diagnostic_cards_must_correct_the_falsehood():
+    """A wrong statement must never be left as the thing the student memorizes."""
+    for grounded in (True, False):
+        prompt = card_gen_prompt(30, grounded=grounded)
+        assert "state the correction explicitly" in prompt
+
+
+def test_grounded_prompt_still_allows_invented_scenarios():
+    """Otherwise "only what the material states" bans examples outright."""
+    prompt = card_gen_prompt(30, grounded=True)
+    assert "invent the scenarios" in prompt
+    assert "only on facts the" in prompt
+
+
+def test_grader_grades_reasoning_not_only_recall():
+    """Applied and diagnostic answers rarely match the stored wording."""
+    prompt = GRADER_PROMPT.lower()
+    assert "reasoning" in prompt
+    assert "find the mistake" in prompt
+    assert "wording differs" in prompt
+
+
+def test_grader_rejects_agreeing_with_a_false_statement():
+    assert "agrees with the false statement" in GRADER_PROMPT
+
+
+def test_grounded_prompt_forbids_inventing_facts():
+    """With material supplied, the student's notes are the syllabus."""
+    prompt = card_gen_prompt(20, grounded=True)
+    assert "Never invent facts" in prompt
+    assert "20" in prompt
+
+
+def test_topic_prompt_licenses_model_knowledge():
+    """Asked to teach a subject, there is no source text to stay inside."""
+    prompt = card_gen_prompt(20, grounded=False)
+    assert "Never invent facts" not in prompt
+    # The phrase wraps across lines in the prompt source, so match on the words
+    # rather than the exact span.
+    assert "own" in prompt and "knowledge" in prompt
+    assert "named a subject" in prompt
+
+
+def test_both_modes_ask_for_specific_topics():
+    """Weak-topic tracking is driven by the tag, so one tag per deck breaks it."""
+    for grounded in (True, False):
+        assert "several specific topics" in card_gen_prompt(5, grounded=grounded)
+
+
+def test_both_modes_still_demand_json_only():
+    for grounded in (True, False):
+        prompt = card_gen_prompt(5, grounded=grounded)
+        assert "JSON only" in prompt
+        assert '"cards"' in prompt
 
 
 def test_grader_prompt_documents_the_full_scale():

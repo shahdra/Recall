@@ -1,0 +1,142 @@
+# Run the whole Recall stack locally in containers.
+#
+#   docker compose up --build -d
+#   open http://localhost:3000
+#
+# The tables are created by the ddb-init service on startup, so this works from a
+# clean checkout and after `docker volume rm recall_ddb-data`.
+#
+# This mirrors what Kubernetes will run in Phase 6: the same images, the same
+# env-var contract, and service-to-service calls over DNS names rather than
+# localhost. Only DynamoDB is faked; Bedrock and Deepgram are the real services.
+services:
+  dynamodb:
+    image: amazon/dynamodb-local
+    # inMemory would lose every deck on restart, which makes "reload the page and
+    # the tutor still knows your weak topics" untestable. -dbPath persists to the
+    # named volume below.
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/data"]
+    working_dir: /home/dynamodblocal
+    user: root  # the image's default `dynamodblocal` user cannot write to /data
+    volumes:
+      - ddb-data:/data
+    ports:
+      # Published so scripts/setup-local-dynamodb.sh and the AWS CLI can reach it
+      # from the host. 8001 matches the port those scripts already default to.
+      - "8001:8000"
+    healthcheck:
+      # DynamoDB Local answers 400 to an unsigned GET, which still proves the
+      # port is serving. The image has no curl, so use the JVM-adjacent tools it
+      # does have: a bare TCP connect via bash's /dev/tcp.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8000' 2>/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Creates the three tables, then exits. Without this, wiping the ddb-data
+  # volume leaves a running-but-broken stack: every call fails with
+  # "Cannot do operations on a non-existent table" and nothing says why.
+  #
+  # Local only. In production the tables come from Terraform, so no service
+  # creates its own schema — that would mask a misconfigured endpoint and race
+  # with IaC. Here it just replaces a manual step that is easy to forget.
+  ddb-init:
+    image: amazon/aws-cli
+    entrypoint: ["/bin/bash", "/scripts/setup-local-dynamodb.sh"]
+    environment:
+      DDB_ENDPOINT: "http://dynamodb:8000"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      # Must match study-mcp's key: DynamoDB Local keeps a separate database per
+      # access key, so a mismatch creates tables the services cannot see.
+      AWS_ACCESS_KEY_ID: "local"
+      AWS_SECRET_ACCESS_KEY: "local"
+    volumes:
+      - ./scripts:/scripts:ro
+    depends_on:
+      dynamodb:
+        condition: service_healthy
+    restart: "no"
+
+  study-mcp:
+    build: ./services/study-mcp
+    environment:
+      PORT: "9000"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      # DynamoDB-scoped on purpose. The unscoped AWS_ENDPOINT_URL applies to every
+      # boto3 service, which would send Bedrock traffic to the local database.
+      AWS_ENDPOINT_URL_DYNAMODB: "http://dynamodb:8000"
+      # DynamoDB Local keeps a separate database per access key, so this must match
+      # the key scripts/setup-local-dynamodb.sh uses ("local") or this service gets
+      # a different, empty database and every read silently returns nothing.
+      #
+      # These dummy keys are scoped to study-mcp alone. study-mcp only ever talks
+      # to DynamoDB; the tutor-agent needs real credentials for Bedrock, and boto3
+      # credentials are global within a process.
+      AWS_ACCESS_KEY_ID: "local"
+      AWS_SECRET_ACCESS_KEY: "local"
+      # Registers the advance_clock/reset_clock/get_clock tools, which let a demo
+      # skip the days a spaced-repetition schedule needs to become visible.
+      #
+      # Local demo only. The offset is process-wide, so it shifts time for every
+      # user of the container — Phase 6's production manifests must leave this
+      # unset, which removes the tools entirely rather than merely hiding them.
+      RECALL_DEMO_MODE: "true"
+    depends_on:
+      dynamodb:
+        condition: service_healthy
+      # Wait for the schema, or the first reads race table creation.
+      ddb-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:9000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      # Cold start imports boto3 and builds the FastMCP app.
+      start_period: 20s
+
+  tutor-agent:
+    build: ./services/tutor-agent
+    environment:
+      PORT: "8000"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      # Reached over compose DNS, not localhost — the same shape as the K8s
+      # Service name the manifests will use.
+      STUDY_MCP_URL: "http://study-mcp:9000/mcp"
+      # Real Bedrock credentials come from the mounted profile below, so no
+      # AWS_ACCESS_KEY_ID here. Anything set would override the profile.
+      AWS_PROFILE: "${AWS_PROFILE:-default}"
+    env_file:
+      # DEEPGRAM_API_KEY. Gitignored, and required — compose fails loudly if the
+      # file is missing rather than starting a stack with voice silently broken.
+      - ./services/tutor-agent/.env
+    volumes:
+      # Read-only so a container cannot rewrite your credentials. Bedrock is a
+      # real remote call; only DynamoDB is local.
+      - ${HOME}/.aws:/home/recall/.aws:ro
+    ports:
+      # 3500 = frontend port + 500. The browser derives the agent URL from
+      # window.location with that offset (services/frontend/lib/api.ts), so this
+      # number is not arbitrary: change the frontend port and change this too.
+      - "3500:8000"
+    depends_on:
+      study-mcp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      # Startup builds the Bedrock model and discovers MCP tools over HTTP.
+      start_period: 45s
+
+  frontend:
+    build: ./services/frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      tutor-agent:
+        condition: service_healthy
+
+volumes:
+  ddb-data:

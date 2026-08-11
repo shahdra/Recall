@@ -1,6 +1,8 @@
 export interface Card {
   card_id: string;
   deck_id: string;
+  /** Filled in by the agent from the deck table. Absent on an older agent. */
+  deck_title?: string;
   front: string;
   back: string;
   topic: string;
@@ -30,9 +32,18 @@ export interface CreateDeckResponse {
   warning?: string;
 }
 
+/** One deck with cards due in this session. Heaviest first. */
+export interface DueDeck {
+  deck_id: string;
+  title: string;
+  due_count: number;
+}
+
 export interface SessionStartResponse {
   cards: Card[];
   profile: LearnerProfile;
+  /** Decks represented in `cards`. Empty when nothing is due. */
+  decks?: DueDeck[];
   /** Present when nothing is due — a friendly state, not an error. */
   message?: string;
 }

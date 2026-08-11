@@ -299,6 +299,67 @@ async def _load_profile(user_id: str) -> dict:
         return {}
 
 
+UNTITLED_DECK = "Untitled deck"
+"""Shown when a card's deck has no title, or the deck lookup failed. A card with
+an odd label is still studiable; a session that 500s is not."""
+
+
+async def _deck_titles(user_id: str) -> dict[str, str]:
+    """Map deck_id to title, or ``{}`` if the decks cannot be read.
+
+    Cards carry ``deck_id`` (their partition key) but not the human-readable
+    title, which lives in the Decks table. Degrades like ``_load_profile``: a
+    label is a convenience, so losing it must not cost the session.
+    """
+    if "list_decks" not in MCP_TOOLS:
+        return {}
+    try:
+        result = await _call_tool("list_decks", user_id=user_id)
+    except Exception:
+        logger.warning("could not load deck titles for %s", user_id, exc_info=True)
+        return {}
+
+    titles = {}
+    for deck in result.get("decks") or []:
+        if not isinstance(deck, dict):
+            continue
+        deck_id = deck.get("deck_id")
+        title = (deck.get("title") or "").strip()
+        if deck_id:
+            titles[str(deck_id)] = title or UNTITLED_DECK
+    return titles
+
+
+def _label_decks(cards: list, titles: dict[str, str]) -> list[dict]:
+    """Stamp ``deck_title`` on each card and summarize the decks represented.
+
+    Returns one entry per deck that actually has a card due — the study view's
+    dropdown should never offer a deck with nothing in it. Ordered by due count
+    descending so the client can advance to the heaviest deck without re-sorting.
+    """
+    counts: dict[str, int] = {}
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        deck_id = str(card.get("deck_id") or "")
+        card["deck_title"] = titles.get(deck_id) or UNTITLED_DECK
+        counts[deck_id] = counts.get(deck_id, 0) + 1
+
+    return [
+        {
+            "deck_id": deck_id,
+            "title": titles.get(deck_id) or UNTITLED_DECK,
+            "due_count": count,
+        }
+        # Ties broken by title so the order is stable rather than dict-insertion
+        # dependent, which would reshuffle the dropdown between sessions.
+        for deck_id, count in sorted(
+            counts.items(),
+            key=lambda pair: (-pair[1], titles.get(pair[0]) or UNTITLED_DECK),
+        )
+    ]
+
+
 async def _refresh_profile_memory(user_id: str) -> None:
     """Recompute the learner's weak topics and stats from their review history.
 
@@ -486,7 +547,11 @@ async def session_start(request: SessionStartRequest):
     due = await _call_tool("get_due_cards", user_id=request.user_id)
     cards = due.get("cards", [])
 
-    response = {"cards": cards, "profile": profile}
+    # Due cards are interleaved across every deck the learner owns, so the study
+    # view needs to know which deck each one came from to group or label them.
+    decks = _label_decks(cards, await _deck_titles(request.user_id)) if cards else []
+
+    response = {"cards": cards, "profile": profile, "decks": decks}
     if not cards:
         response["message"] = "Nothing due right now — want to study ahead?"
     return response

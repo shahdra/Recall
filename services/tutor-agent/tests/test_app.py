@@ -249,6 +249,111 @@ def test_session_start_handles_no_due_cards_as_success(client):
     assert response.json().get("message")
 
 
+# --- deck labelling on a session ----------------------------------------------
+#
+# Due cards are queried by user_id across every deck, so a session is one
+# interleaved queue. These pin down that each card says which deck it came from,
+# and that a broken deck lookup costs the label rather than the session.
+
+
+def _make_deck(client, monkeypatch, title, fronts):
+    """Create a real deck through /decks so its cards land in the fake tables."""
+    monkeypatch.setattr(
+        app_module,
+        "generate_cards",
+        lambda material, llm, **kw: [
+            {"front": f, "back": f"A-{f}", "topic": "t"} for f in fronts
+        ],
+    )
+    response = client.post(
+        "/decks", json={"user_id": "u1", "title": title, "text": "material"}
+    )
+    assert response.status_code == 200
+    return response.json()["deck_id"]
+
+
+def test_due_cards_are_labelled_with_their_deck_title(client, monkeypatch):
+    _make_deck(client, monkeypatch, "Cell biology", ["Q1"])
+    body = client.post("/session/start", json={"user_id": "u1"}).json()
+    assert [c["deck_title"] for c in body["cards"]] == ["Cell biology"]
+
+
+def test_session_lists_each_due_deck_with_its_count(client, monkeypatch):
+    _make_deck(client, monkeypatch, "Kubernetes", ["K1", "K2", "K3"])
+    _make_deck(client, monkeypatch, "Cell biology", ["C1"])
+
+    body = client.post("/session/start", json={"user_id": "u1"}).json()
+    decks = {d["title"]: d["due_count"] for d in body["decks"]}
+    assert decks == {"Kubernetes": 3, "Cell biology": 1}
+    # Heaviest first, so the client can advance to the next deck without sorting.
+    assert body["decks"][0]["title"] == "Kubernetes"
+
+
+def test_deck_list_covers_every_card_in_the_queue(client, monkeypatch):
+    """The dropdown must account for the whole session, not a subset."""
+    _make_deck(client, monkeypatch, "Kubernetes", ["K1", "K2"])
+    _make_deck(client, monkeypatch, "Cell biology", ["C1"])
+
+    body = client.post("/session/start", json={"user_id": "u1"}).json()
+    assert sum(d["due_count"] for d in body["decks"]) == len(body["cards"])
+
+
+def test_deck_list_omits_decks_with_nothing_due(client, monkeypatch):
+    """An empty deck in the dropdown would offer a session with no cards."""
+    _make_deck(client, monkeypatch, "Has cards", ["Q1"])
+    monkeypatch.setattr(app_module, "generate_cards", lambda material, llm, **kw: [])
+    client.post("/decks", json={"user_id": "u1", "title": "Empty", "text": "m"})
+
+    body = client.post("/session/start", json={"user_id": "u1"}).json()
+    assert [d["title"] for d in body["decks"]] == ["Has cards"]
+
+
+def test_nothing_due_means_no_decks_to_choose_from(client):
+    body = client.post("/session/start", json={"user_id": "u1"}).json()
+    assert body["decks"] == []
+    assert body.get("message")
+
+
+def test_untitled_deck_still_gets_a_label(client, monkeypatch):
+    """A card whose deck has no title must not render a blank chip."""
+    _make_deck(client, monkeypatch, "   ", ["Q1"])
+    body = client.post("/session/start", json={"user_id": "u1"}).json()
+    assert body["cards"][0]["deck_title"] == app_module.UNTITLED_DECK
+    assert body["decks"][0]["title"] == app_module.UNTITLED_DECK
+
+
+def test_a_failed_deck_lookup_costs_the_label_not_the_session(client, monkeypatch):
+    """Losing the deck titles must degrade to studiable cards, not a 502."""
+    _make_deck(client, monkeypatch, "Cell biology", ["Q1"])
+
+    async def boom(name, **kwargs):
+        if name == "list_decks":
+            raise RuntimeError("study-mcp down")
+        return await real_call_tool(name, **kwargs)
+
+    real_call_tool = app_module._call_tool
+    monkeypatch.setattr(app_module, "_call_tool", boom)
+
+    response = client.post("/session/start", json={"user_id": "u1"})
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["cards"]) == 1
+    assert body["cards"][0]["deck_title"] == app_module.UNTITLED_DECK
+    # Still one deck to study, even though its name is unknown.
+    assert len(body["decks"]) == 1
+
+
+def test_missing_list_decks_tool_does_not_break_a_session(client, monkeypatch):
+    """An older study-mcp without the tool should still serve cards."""
+    _make_deck(client, monkeypatch, "Cell biology", ["Q1"])
+    monkeypatch.setitem(app_module.MCP_TOOLS, "list_decks", None)
+    monkeypatch.delitem(app_module.MCP_TOOLS, "list_decks")
+
+    response = client.post("/session/start", json={"user_id": "u1"})
+    assert response.status_code == 200
+    assert response.json()["cards"][0]["deck_title"] == app_module.UNTITLED_DECK
+
+
 # --- POST /session/answer -----------------------------------------------------
 
 

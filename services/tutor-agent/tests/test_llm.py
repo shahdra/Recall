@@ -1,6 +1,6 @@
 import pytest
 
-from llm import DEFAULT_FALLBACK_MODEL, DEFAULT_MODEL, build_llm
+from llm import DEFAULT_FALLBACK_MODEL, DEFAULT_MODEL, MAX_TOKENS, build_llm
 
 
 class Recorder:
@@ -68,16 +68,48 @@ def test_temperature_zero_is_requested():
 
 def test_defaults_point_at_allowlisted_bedrock_models():
     """The course IAM policy denies anything outside its allowlist."""
-    assert DEFAULT_MODEL == "bedrock:amazon.nova-lite-v1:0"
-    assert DEFAULT_FALLBACK_MODEL == (
-        "bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0"
-    )
+    assert DEFAULT_MODEL == "bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    assert DEFAULT_FALLBACK_MODEL == "bedrock:amazon.nova-lite-v1:0"
 
 
 def test_fallback_is_a_different_provider_than_primary():
-    """A same-provider fallback would share the outage it exists to survive."""
-    assert "nova" in DEFAULT_MODEL
-    assert "nova" not in DEFAULT_FALLBACK_MODEL
+    """A same-provider fallback would share the outage it exists to survive.
+
+    Asserted as a property rather than by naming which model leads, so swapping
+    the order stays a one-line change to the defaults above.
+    """
+    providers = {
+        model.split(":", 1)[1].split(".", 1)[0].removeprefix("us-").removeprefix("us")
+        for model in (DEFAULT_MODEL, DEFAULT_FALLBACK_MODEL)
+    }
+    assert len(providers) == 2, f"both models come from one provider: {providers}"
+
+
+def test_max_tokens_is_large_enough_for_a_full_deck():
+    """A low output cap truncates the JSON mid-card, which parses to zero cards.
+
+    Haiku returned 0 of 40 requested cards on Bedrock's default cap and 40 of 40
+    with this set, so it is a correctness requirement rather than tuning.
+    """
+    from card_generator import DEFAULT_MAX_CARDS
+    from llm import MAX_TOKENS
+
+    # ~150 tokens of JSON per card, plus room for the wrapper.
+    assert MAX_TOKENS >= DEFAULT_MAX_CARDS * 150
+
+
+def test_max_tokens_is_requested_for_primary_and_fallback():
+    """A fallback with a smaller cap would truncate decks after failover."""
+    captured = []
+
+    def init(model, **kwargs):
+        captured.append(kwargs)
+        return model
+
+    build_llm("primary", "secondary", init=init)
+    assert len(captured) == 2
+    for kwargs in captured:
+        assert kwargs.get("max_tokens") == MAX_TOKENS
 
 
 def test_error_message_names_both_models():

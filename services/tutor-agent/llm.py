@@ -15,12 +15,28 @@ import time
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "bedrock:amazon.nova-lite-v1:0"
-DEFAULT_FALLBACK_MODEL = "bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0"
+DEFAULT_MODEL = "bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0"
+"""Haiku leads because it tags cards with several specific topics where Nova
+labels a whole deck with one. Weak-topic tracking is driven by that tag, so
+Nova's single label makes the tutor unable to say *which part* of a subject the
+learner is failing — the feature degrades to nothing."""
+
+DEFAULT_FALLBACK_MODEL = "bedrock:amazon.nova-lite-v1:0"
 
 TEMPERATURE = 0
 """Zero so grading and card generation are reproducible: the same answer should
 get the same grade twice, or the learner's schedule becomes arbitrary."""
+
+MAX_TOKENS = 8192
+"""Enough for a 40-card JSON deck.
+
+Required, not tuning: Anthropic models on Bedrock default to a low output cap, and
+a deck that exceeds it comes back as JSON cut off mid-card, which parses to an
+empty deck. Haiku returned 0 of 40 cards without this and 40 of 40 with it."""
+
+_MODEL_KWARGS = {"temperature": TEMPERATURE, "max_tokens": MAX_TOKENS}
+"""Applied to the primary and the fallback alike. If the fallback were built with
+a smaller output cap, failing over mid-session would start truncating decks."""
 
 _UNSET = object()
 """Distinguishes "argument omitted, read the environment" from an explicit
@@ -166,7 +182,7 @@ def build_llm(
 
     primary = None
     try:
-        primary = init(model, temperature=TEMPERATURE)
+        primary = init(model, **_MODEL_KWARGS)
         logger.info("initialized primary model %s", model)
     except Exception as primary_error:
         logger.warning("primary model %s failed to initialize: %s", model, primary_error)
@@ -177,7 +193,7 @@ def build_llm(
 
         # Promote the fallback: with no working primary there is nothing to retry.
         try:
-            promoted = init(fallback, temperature=TEMPERATURE)
+            promoted = init(fallback, **_MODEL_KWARGS)
         except Exception as fallback_error:
             raise RuntimeError(
                 f"could not initialize model {model!r} or fallback {fallback!r}"
@@ -188,7 +204,7 @@ def build_llm(
     secondary = None
     if fallback:
         try:
-            secondary = init(fallback, temperature=TEMPERATURE)
+            secondary = init(fallback, **_MODEL_KWARGS)
             logger.info("fallback model %s ready", fallback)
         except Exception as exc:
             # Not fatal: the primary works, so serve traffic without a safety net

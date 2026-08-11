@@ -42,7 +42,7 @@ export default function UploadView({ userId, onDeckCreated }: Props) {
 
     const deckTitle = title.trim() || "Untitled deck";
     if (!file && !text.trim()) {
-      toast.error("Paste some text or choose a PDF first.");
+      toast.error("Paste some notes, name a subject, or choose a PDF first.");
       return;
     }
 
@@ -81,8 +81,9 @@ export default function UploadView({ userId, onDeckCreated }: Props) {
       <div>
         <h2 className="text-lg font-semibold">Add study material</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          Paste your notes or upload a PDF. Recall turns them into flashcards and
-          schedules reviews for you.
+          Paste your notes, upload a PDF, or just name a subject — try{" "}
+          <span className="font-medium text-foreground">teach me Kubernetes</span>.
+          Recall turns it into flashcards and schedules reviews for you.
         </p>
       </div>
 
@@ -101,7 +102,7 @@ export default function UploadView({ userId, onDeckCreated }: Props) {
 
       <div className="space-y-1.5">
         <label htmlFor="deck-text" className="text-sm font-medium">
-          Your notes
+          Your notes, or a subject to learn
         </label>
         <textarea
           id="deck-text"
@@ -109,7 +110,7 @@ export default function UploadView({ userId, onDeckCreated }: Props) {
           onChange={(event) => setText(event.target.value)}
           disabled={Boolean(file)}
           rows={8}
-          placeholder="Paste the material you're studying…"
+          placeholder="Paste the material you're studying, or write “teach me Kubernetes”…"
           className="w-full resize-y rounded-lg border bg-card px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-primary/40 disabled:opacity-50"
         />
       </div>

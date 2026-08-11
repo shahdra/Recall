@@ -114,6 +114,16 @@ def mcp_tools():
     def get_due_cards(args):
         return {"cards": list(state["cards"].values())}
 
+    def list_decks(args):
+        # Served from the same state create_deck writes, so a deck's title can be
+        # joined onto its cards. A constant [] here silently defeated that.
+        return {
+            "decks": [
+                {"deck_id": deck_id, "title": deck["title"]}
+                for deck_id, deck in state["decks"].items()
+            ]
+        }
+
     def grade_card(args):
         return {"interval_days": 1, "due_date": "2026-06-02", "ease_factor": 2.5}
 
@@ -125,7 +135,7 @@ def mcp_tools():
         "get_progress": FakeMCPTool(
             "get_progress", {"total_reviews": 4, "accuracy": 0.75, "weak_topics": {"bio": 0.5}}
         ),
-        "list_decks": FakeMCPTool("list_decks", {"decks": []}),
+        "list_decks": FakeMCPTool("list_decks", list_decks),
         "get_profile": FakeMCPTool(
             "get_profile",
             {"user_id": "u1", "weak_topics": {}, "preferences": {}, "stats": {}, "notes": ""},
