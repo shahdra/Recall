@@ -106,7 +106,8 @@ async def test_add_then_due_then_grade_over_mcp(mcp_tools):
         card_id=added["card_id"],
         quality=5,
     )
-    assert graded["interval_days"] == 1
+    # A perfect first recall earns 4 days (sm2.FIRST_INTERVALS), not SM-2's 1.
+    assert graded["interval_days"] == 4
     assert graded["due_date"]
 
 
@@ -126,12 +127,14 @@ async def test_graded_card_leaves_the_due_queue(mcp_tools):
 
 
 async def test_sm2_interval_grows_across_successive_correct_grades(mcp_tools):
-    """The 1 -> 6 -> 16 day progression, driven entirely over MCP.
+    """The 4 -> 9 -> 24 day progression, driven entirely over MCP.
 
-    16 rather than 6 * 2.5 = 15: a perfect grade raises the ease factor, so by
-    the third review the card's ease is 2.6 and round(6 * 2.6) = 16. The Phase 1
-    unit test sees 15 because it passes a fixed ease of 2.5 rather than letting it
-    accumulate across reviews.
+    The first two come from sm2.FIRST_INTERVALS/SECOND_INTERVALS at quality 5,
+    which reward a perfect recall rather than using SM-2's flat 1 -> 6 ramp.
+    The third is the ease multiplier taking over: three perfect grades have
+    raised ease to 2.7, and round(9 * 2.7) = 24. The unit test sees a different
+    third value because it passes a fixed ease rather than letting it accumulate
+    across reviews.
     """
     deck = await call(mcp_tools, "create_deck", user_id="rt3", title="Physics")
     added = await call(
@@ -149,8 +152,8 @@ async def test_sm2_interval_grows_across_successive_correct_grades(mcp_tools):
         intervals.append(graded["interval_days"])
         eases.append(float(graded["ease_factor"]))
 
-    assert intervals == [1, 6, 16]
-    # Ease must rise monotonically, which is what produced the 16.
+    assert intervals == [4, 9, 24]
+    # Ease must rise monotonically, which is what produced the 24.
     assert eases == sorted(eases)
     assert eases[0] > 2.5
 

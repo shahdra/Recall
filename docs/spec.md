@@ -162,12 +162,15 @@ The Grader returns a quality grade `q` (0 = blank … 5 = perfect recall). On ea
 review, `grade_card` runs:
 
 ```
+FIRST_INTERVALS  = {3: 1, 4: 2, 5: 4}   # days after the 1st successful recall
+SECOND_INTERVALS = {3: 6, 4: 7, 5: 9}   # days after the 2nd
+
 if q < 3:                       # incorrect
     repetitions   = 0
     interval_days = 1           # resurface tomorrow
 else:                           # correct
-    if   repetitions == 0: interval_days = 1
-    elif repetitions == 1: interval_days = 6
+    if   repetitions == 0: interval_days = FIRST_INTERVALS[q]
+    elif repetitions == 1: interval_days = SECOND_INTERVALS[q]
     else:                  interval_days = round(interval_days * ease_factor)
     repetitions += 1
 
@@ -178,8 +181,20 @@ due_date = today + interval_days
 ```
 
 Behavior: missed cards reset to a 1-day interval and their ease drops (they nag
-you); repeatedly-correct cards grow `1 → 6 → ~15 → ~37 → ~90` days (they fade
-out). Fully deterministic → precisely unit-testable → the core "measurable value"
+you); repeatedly-correct cards fade out, at a rate set by how well they were
+recalled — a card always graded 5 grows `4 → 9 → 24 → 67 → 194` days, one always
+graded 3 grows `1 → 6 → 13 → 27 → 52`.
+
+The first two intervals depend on the grade, which is a deliberate departure
+from published SM-2's flat `1 → 6` ramp. Stock SM-2 makes a perfect 5 and a
+barely-passing 3 indistinguishable where the learner actually looks — both say
+"next review in 1 day" — because the grade only reaches the interval through the
+ease factor, three reviews later. Grade 3 keeps SM-2's exact 1 and 6, so it
+remains the conservative path that the rewards for 4 and 5 are visible against.
+The trade is some of SM-2's caution about first-recall evidence: a card graded
+minutes after reading the material may still be in working memory.
+
+Fully deterministic → precisely unit-testable → the core "measurable value"
 story. **The LLM never performs this math.**
 
 ---

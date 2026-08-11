@@ -15,6 +15,29 @@ an ever-shrinking interval and nag forever."""
 PASSING_GRADE = 3
 """Grades 0-2 count as a lapse and reset the repetition streak; 3-5 pass."""
 
+# Grade-dependent early intervals, keyed by the grade just earned.
+#
+# SM-2 publishes a flat 1 -> 6 ramp regardless of grade, which makes a perfect 5
+# and a barely-passing 3 indistinguishable where the learner actually looks: both
+# say "next review in 1 day". The ease factor does record the difference, but it
+# does not reach the interval until the third review, so grading reads as inert.
+#
+# Rewarding 4 and 5 with a longer first gap trades away some of SM-2's caution
+# about first-recall evidence — a card graded 5 minutes after reading the
+# material may still be in working memory — for a schedule the learner can see
+# responding to how well they answered. Grade 3 deliberately keeps SM-2's exact
+# 1 and 6, so "barely passing" remains the conservative path and the reward for
+# 4 and 5 is visible against it.
+FIRST_INTERVALS = {3: 1, 4: 2, 5: 4}
+"""Days until the first review after one successful recall."""
+
+SECOND_INTERVALS = {3: 6, 4: 7, 5: 9}
+"""Days until the second review after two consecutive successful recalls."""
+
+_SM2_FIRST = 1
+_SM2_SECOND = 6
+"""SM-2's own ramp, used as the fallback for a grade outside the tables."""
+
 
 def schedule(
     ease_factor: float,
@@ -35,17 +58,22 @@ def schedule(
         The card's new ``ease_factor``, ``interval_days``, and ``repetitions``.
 
     A lapse (quality < 3) resets the streak and resurfaces the card tomorrow.
-    A pass grows the interval 1 -> 6 -> interval * ease, so a well-known card
-    fades to roughly 15, 37, then 90 days.
+    A pass sets the first two intervals from the grade earned (see
+    FIRST_INTERVALS and SECOND_INTERVALS), then grows as interval * ease: a card
+    answered 5 every time runs 4 -> 9 -> 24 -> 67 -> 194 days, while one always
+    answered 3 runs 1 -> 6 -> 13 -> 27 -> 52.
     """
     if quality < PASSING_GRADE:
         repetitions = 0
         interval_days = 1
     else:
+        # .get with an SM-2 fallback rather than [quality]: callers clamp the
+        # grade to 0-5, but a KeyError here would turn a bad grade into a failed
+        # review instead of a conservatively-scheduled one.
         if repetitions == 0:
-            interval_days = 1
+            interval_days = FIRST_INTERVALS.get(quality, _SM2_FIRST)
         elif repetitions == 1:
-            interval_days = 6
+            interval_days = SECOND_INTERVALS.get(quality, _SM2_SECOND)
         else:
             interval_days = round(interval_days * ease_factor)
         repetitions += 1

@@ -40,20 +40,30 @@ def test_grade_card_wrong_answer_due_tomorrow():
 
 
 def test_grade_card_correct_grows_interval():
+    """A perfect first recall earns 4 days, not stock SM-2's 1."""
     app._create_deck("u1", "Bio", None, deck_id="d1")
     app._add_card("d1", "u1", "Q", "A", "bio", card_id="c1")
     out = app._grade_card("d1", "c1", quality=5)
+    assert out["interval_days"] == 4
+    assert out["due_date"] == "2026-06-05"  # +4 days
+
+
+def test_grade_card_barely_passing_still_due_tomorrow():
+    """Grade 3 keeps the conservative 1-day gap, so the reward for 5 is visible."""
+    app._create_deck("u1", "Bio", None, deck_id="d1")
+    app._add_card("d1", "u1", "Q", "A", "bio", card_id="c1")
+    out = app._grade_card("d1", "c1", quality=3)
     assert out["interval_days"] == 1
     assert out["due_date"] == "2026-06-02"
 
 
-def test_grade_card_second_correct_jumps_to_six_days():
+def test_grade_card_second_correct_jumps_to_nine_days():
     app._create_deck("u1", "Bio", None, deck_id="d1")
     app._add_card("d1", "u1", "Q", "A", "bio", card_id="c1")
     app._grade_card("d1", "c1", quality=5)
     out = app._grade_card("d1", "c1", quality=5)
-    assert out["interval_days"] == 6
-    assert out["due_date"] == "2026-06-07"
+    assert out["interval_days"] == 9
+    assert out["due_date"] == "2026-06-10"
 
 
 def test_grade_card_clamps_out_of_range_quality():
