@@ -1,0 +1,21 @@
+fastapi
+uvicorn
+langchain
+langchain-core
+langchain-aws
+langchain-mcp-adapters
+# mcp 2.0.0 renamed RequestContext, which langchain-mcp-adapters 0.3.1 still
+# imports from mcp.shared.context. Pin to 1.x until the adapter catches up.
+mcp<2.0.0
+boto3
+pypdf
+deepgram-sdk
+prometheus-fastapi-instrumentator
+prometheus-client
+pydantic
+python-dotenv
+httpx
+pytest
+pytest-asyncio
+pytest-cov
+moto[dynamodb,s3]

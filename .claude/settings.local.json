@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/pytest tests/test_app.py -q)",
+      "Bash(.venv/bin/pytest -q -m \"not integration\")",
+      "Bash(AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:8001 PORT=9001 .venv/bin/python app.py)",
+      "Bash(curl -s -o /dev/null -w \"study-mcp /health: HTTP %{http_code}\\\\n\" http://127.0.0.1:9001/health)",
+      "Read(//tmp/**)",
+      "Bash(lsof -ti:8010,9001)",
+      "Bash(xargs kill -9)",
+      "Bash(AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:8001 PORT=9001 nohup .venv/bin/python app.py)",
+      "Bash(curl -s http://127.0.0.1:9001/health)",
+      "Bash(echo \"mcp health: $\\(curl -s http://127.0.0.1:9001/health\\)\")",
+      "Bash(.venv/bin/pytest tests/test_tools.py -q -k \"null or expected_tools\" -v)",
+      "Bash(.venv/bin/python *)",
+      "Bash(bash /tmp/start_recall.sh)",
+      "Bash(bash /tmp/e2e.sh)",
+      "Bash(python3 *)",
+      "Bash(AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:8001 .venv/bin/python -c ' *)",
+      "Bash(AWS_ENDPOINT_URL_DYNAMODB=http://localhost:8001 AWS_REGION=us-east-1 aws dynamodb list-tables --endpoint-url http://localhost:8001)",
+      "Bash(chmod +x scripts/start-local.sh)",
+      "Bash(.venv/bin/pytest tests/test_prompts.py -q)",
+      "Bash(.venv/bin/pytest tests/test_app.py -q -k \"mcp_tool_error or error_detection\")",
+      "Bash(bash scripts/start-local.sh)",
+      "Bash(.venv/bin/pytest tests/test_metrics.py -q)",
+      "Bash(awk '/^@@/{h++; print \"\\\\n### hunk \" h \": \" $0; c=0; next} h>0 && /^\\\\+/ && !/^\\\\+\\\\+\\\\+/{c++; if\\(c<=3\\) print \"   \" substr\\($0,1,78\\)}')"
+    ]
+  }
+}
