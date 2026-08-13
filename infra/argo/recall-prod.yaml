@@ -1,0 +1,63 @@
+# ArgoCD Application — Recall in the prod namespace.
+#
+# Identical to recall-dev.yaml except for the branch, the destination namespace,
+# and the ABSENCE of an `automated` sync policy. That absence is the promotion
+# gate: a merge to main marks this app OutOfSync and someone then presses Sync,
+# either in the ArgoCD UI or with
+#
+#   argocd app sync recall-prod
+#
+# Apply once by hand (ArgoCD manages everything after that):
+#   kubectl apply -f infra/argo/recall-prod.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: recall-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: recall
+  # Without this finalizer, deleting the Application orphans the running
+  # workloads — they keep serving with nothing managing them.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/shahdra/Recall.git
+
+    # prod tracks main; dev tracks the dev branch. Merging dev -> main is what
+    # makes a change eligible for production.
+    targetRevision: main
+
+    path: infra/k8s/prod
+
+    directory:
+      recurse: true
+      # No exclude pattern, and no Secret template in this tree — see the note in
+      # recall-dev.yaml. The real recall-secrets is created out-of-band.
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: prod
+
+  syncPolicy:
+    # NO `automated:` BLOCK. This is deliberate and is the whole difference
+    # between the two environments. Adding one here removes the human checkpoint
+    # in front of production; if prod should track main automatically, that is a
+    # decision to make explicitly, not by copying dev's file.
+    #
+    # Note the side effect: without `selfHeal`, a manual `kubectl edit` in prod
+    # survives until the next sync. That is the correct trade for an incident
+    # (you can hotfix without git) but it means prod can drift — `argocd app diff
+    # recall-prod` is how you check.
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m
