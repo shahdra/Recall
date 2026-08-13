@@ -1,0 +1,183 @@
+# tutor-agent (prod namespace) — the ReAct agent the browser talks to.
+#
+# NodePort, because the frontend calls this directly from the browser rather than
+# proxying through Next.js. services/frontend/lib/api.ts:12-33 derives the URL at
+# runtime as `frontendPort + 500`, so prod's 31300 frontend must find its agent on
+# 31800. That arithmetic is load-bearing: putting this behind an Ingress on 443
+# makes the browser fall back to same-origin and every API call 404s against the
+# frontend.
+#
+# PORT EXCLUSIVITY: 30800/31800 are also claimed by the PolyAIFursa project's
+# committed manifests. NodePorts are cluster-wide, not namespaced, so the two
+# projects cannot run on the same cluster at once — whichever applies second gets
+# "provided port is already allocated". Recall replaces it here by design.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tutor-agent
+  namespace: prod
+  labels:
+    app: tutor-agent
+    app.kubernetes.io/part-of: recall
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tutor-agent
+  template:
+    metadata:
+      labels:
+        app: tutor-agent
+        app.kubernetes.io/part-of: recall
+      annotations:
+        # Prometheus scrapes the agent's request/latency/token counters. This is
+        # the only Recall service with a /metrics endpoint.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001 # `recall` in services/tutor-agent/Dockerfile
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # THE AGENT DISCOVERS ITS MCP TOOLS EXACTLY ONCE, AT STARTUP, AND NEVER
+      # RETRIES (services/tutor-agent/app.py:139-147). The failure is swallowed and
+      # logged (app.py:106-110), so if study-mcp is unreachable during boot the pod
+      # comes up "healthy", reports mcp_tools: 0, and 503s every study request until
+      # someone restarts it by hand.
+      #
+      # Compose solves this with `depends_on: service_healthy`; Kubernetes has no
+      # such ordering, hence this gate. Fixing the retry in application code would
+      # be the better answer, but that is Phase 3 code and out of scope here.
+      initContainers:
+        - name: wait-for-study-mcp
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - |
+              # Probe /health, not /mcp: /mcp needs an MCP session handshake and
+              # would never look "up" to wget.
+              until wget -q -T 3 -O /dev/null http://study-mcp:9000/health; do
+                echo "waiting for study-mcp/health..."
+                sleep 2
+              done
+              echo "study-mcp is up"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      containers:
+        - name: tutor-agent
+          image: shahdra/recall-tutor-agent:6689d49
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: recall-config
+            - secretRef:
+                name: recall-secrets # AWS keys + DEEPGRAM_API_KEY
+          # Boot does real work before uvicorn binds: init_chat_model constructs
+          # the Bedrock client and MCP tool discovery makes a network round trip.
+          # The startupProbe covers that window so a slow boot is not mistaken for
+          # a hung process and restart-looped.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24 # up to ~120s
+          # /health always returns 200 and never touches AWS or study-mcp — it
+          # reports `mcp_tools: 0` rather than failing when study-mcp is down. So
+          # this detects a dead process, not a degraded one. Deliberate: a restart
+          # cannot fix Bedrock throttling or a study-mcp outage, and restarting on
+          # a dependency's failure turns one outage into a crash-loop.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              # No CPU limit: the HPA below scales on CPU utilisation, and a
+              # throttled pod reports lower CPU than it actually wants — which
+              # suppresses the very scale-up the load calls for. Memory is capped.
+              memory: 512Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tutor-agent
+  namespace: prod
+  labels:
+    app: tutor-agent
+    app.kubernetes.io/part-of: recall
+spec:
+  type: NodePort
+  selector:
+    app: tutor-agent
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      # prod agent — the browser reaches http://<node-ip>:31800.
+      # MUST be the prod frontend's nodePort (31300) + 500; see api.ts:17.
+      nodePort: 31800
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tutor-agent
+  namespace: prod
+  labels:
+    app: tutor-agent
+    app.kubernetes.io/part-of: recall
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tutor-agent
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    # CPU rather than a custom request-rate metric: the cluster runs
+    # metrics-server but no Prometheus Adapter, so CPU is what the HPA can
+    # actually read.
+    #
+    # Note the mismatch this implies — the agent's real cost is time spent waiting
+    # on Bedrock, which burns latency, not CPU. So this scales on card generation
+    # and JSON parsing rather than on the thing that actually makes requests slow.
+    # It satisfies the autoscaling requirement honestly; a latency-driven policy
+    # would need the adapter.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50

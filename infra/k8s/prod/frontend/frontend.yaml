@@ -1,0 +1,126 @@
+# frontend (prod namespace) — the Next.js UI.
+#
+# NodePort so a reviewer can open it directly: http://<node-ip>:31300
+#
+# The port number is not arbitrary. lib/api.ts:12-33 derives the tutor-agent's URL
+# in the browser as `frontendPort + 500`, so 31300 here pairs with the agent's
+# 31800. Change one without the other and the UI loads but every request goes
+# nowhere. That runtime derivation is also why one image serves both dev and prod:
+# NEXT_PUBLIC_* vars are inlined at build time, so a baked-in URL would mean a
+# rebuild per environment and per node-IP change.
+#
+# PORT EXCLUSIVITY: 30300/31300 are also claimed by the PolyAIFursa project's
+# committed manifests. NodePorts are cluster-wide, so both projects cannot be
+# deployed at once; Recall replaces it here by design.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: prod
+  labels:
+    app: frontend
+    app.kubernetes.io/part-of: recall
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+        app.kubernetes.io/part-of: recall
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # 1000 is `node` in node:20-alpine — NOT 10001. The two Python services
+        # build their own `recall` user at 10001; this image reuses the one the
+        # base image already ships.
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frontend
+          image: shahdra/recall-frontend:6689d49
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            # Bound to all interfaces by the image already; repeated here because
+            # a server listening on localhost inside a pod is unreachable from the
+            # Service and presents as a probe failure with no useful log line.
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: PORT
+              value: "3000"
+          # No envFrom: the browser needs no AWS credentials or table names, and
+          # mounting recall-secrets here would put the Deepgram and AWS keys in a
+          # pod that has no use for them. The agent URL is derived at runtime, so
+          # there is genuinely nothing to configure.
+          #
+          # Probes hit `/` because the app has no health route — app/ contains only
+          # layout, page and globals. A 200 from `/` means the Next server is
+          # rendering, which is all this pod is responsible for.
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 3
+            failureThreshold: 20 # ~60s
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # The Next server writes its cache under .next/cache at runtime, which
+            # a read-only root filesystem forbids. An emptyDir keeps the root
+            # read-only while giving it the one writable path it needs; the cache
+            # is per-pod and disposable, so losing it on restart costs nothing.
+            - name: next-cache
+              mountPath: /app/.next/cache
+      volumes:
+        - name: next-cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: prod
+  labels:
+    app: frontend
+    app.kubernetes.io/part-of: recall
+spec:
+  type: NodePort
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+      # prod frontend — open http://<node-ip>:31300 in the browser.
+      # The agent's nodePort must stay exactly 500 higher (see api.ts:17).
+      nodePort: 31300
+# No HPA. Serving a static bundle is not CPU-bound, and the browser talks to the
+# agent directly, so frontend replicas do nothing for study throughput.

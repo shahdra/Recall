@@ -1,0 +1,54 @@
+# Non-secret configuration for every Recall service in the prod namespace.
+#
+# Identical to dev except for `namespace` and the deliberate ABSENCE of
+# RECALL_DEMO_MODE (see the end of this file). Both environments read the same
+# DynamoDB tables and the same S3 bucket: separating them would mean six tables
+# and two buckets in an account shared with the course, for a project whose prod
+# and dev are the same handful of learners. Environment separation here is about
+# deployment (namespace, replica counts, promotion gate), not data.
+#
+# THE TABLE/BUCKET/TOPIC VALUES COME FROM TERRAFORM — regenerate, don't retype:
+#
+#   cd infra/terraform
+#   terraform output -json | jq -r '.configmap_env.value | to_entries[] | "\(.key)=\(.value)"'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: recall-config
+  namespace: prod
+  labels:
+    app.kubernetes.io/part-of: recall
+data:
+  # --- AWS resource names (from `terraform output configmap_env`) ---
+  RECALL_CARDS_TABLE: "shahdra-recall-Cards"
+  RECALL_DECKS_TABLE: "shahdra-recall-Decks"
+  RECALL_PROFILE_TABLE: "shahdra-recall-LearnerProfile"
+  RECALL_S3_BUCKET: "shahdra-recall-us-east-1-uploads-228281126655"
+  RECALL_SNS_TOPIC_ARN: "arn:aws:sns:us-east-1:228281126655:shahdra-recall-us-east-1-reminders"
+  AWS_REGION: "us-east-1"
+
+  # --- Cluster topology ---
+  #
+  # The `/mcp` suffix is required — that is the streamable-http endpoint; the bare
+  # Service root does not speak MCP. Resolves within the namespace, so this same
+  # value reaches prod's study-mcp, not dev's.
+  STUDY_MCP_URL: "http://study-mcp:9000/mcp"
+
+  # --- Models ---
+  MODEL: "bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0"
+  FALLBACK_MODEL: "bedrock:amazon.nova-lite-v1:0"
+
+  # --- Behaviour ---
+  LOG_LEVEL: "INFO"
+  CORS_ORIGINS: "*"
+
+  # RECALL_DEMO_MODE IS INTENTIONALLY ABSENT.
+  #
+  # Not "false" — absent. The demo clock's offset is process-wide, so one user
+  # pressing ⏩ would shift "today" for every learner sharing the pod and corrupt
+  # everyone's review schedule. study-mcp registers the clock MCP tools and the
+  # tutor-agent registers its /demo/* routes based on this key being set, so
+  # leaving it out means the capability does not exist here at all rather than
+  # existing behind a flag that a typo could flip.
+  #
+  # Do not add it to this file. To demo, use the dev namespace.
