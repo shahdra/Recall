@@ -79,7 +79,7 @@ spec:
               drop: ["ALL"]
       containers:
         - name: tutor-agent
-          image: shahdra/recall-tutor-agent:6689d49
+          image: shahdra/recall-tutor-agent:f71085825950f8fdb916adfce2a1318b06737ec5
           ports:
             - name: http
               containerPort: 8000
