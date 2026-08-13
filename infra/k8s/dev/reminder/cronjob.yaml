@@ -79,7 +79,7 @@ spec:
               type: RuntimeDefault
           containers:
             - name: reminder
-              image: shahdra/recall-reminder:6689d49
+              image: shahdra/recall-reminder:f71085825950f8fdb916adfce2a1318b06737ec5
               envFrom:
                 - configMapRef:
                     name: recall-config # tables + RECALL_SNS_TOPIC_ARN + AWS_REGION
