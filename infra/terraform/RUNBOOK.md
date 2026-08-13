@@ -1,43 +1,153 @@
 # Recall infrastructure runbook
 
-Operational steps for `infra/terraform/`. Everything Terraform *cannot* do is here:
-creating the state bucket, minting the app's access keys, and confirming the email
-subscription.
+How to build Recall's AWS infrastructure, what it costs, and how to tear it down.
 
-> **`terraform apply` needs instructor approval before it is run.** The AWS account
-> (228281126655) is shared with the course — see `docs/plan.md:827`. Everything
-> below up to and including `plan` is safe and read-only.
+Two layers, one `terraform apply`:
+
+1. **Data plane** — three DynamoDB tables, the uploads bucket, the reminder SNS
+   topic, and a least-privilege IAM user whose keys the pods use. Nearly free at rest.
+2. **Compute** — a VPC and a kubeadm Kubernetes cluster on EC2 (one control plane +
+   a worker Auto Scaling Group). **This is what costs money.**
+
+> **Terraform is only half the deploy.** `terraform apply` leaves you with nodes that
+> report `NotReady` forever, because nothing has installed a CNI. `infra/k8s/bootstrap.sh`
+> is the second half and runs over SSH — see [§5](#5-bootstrap-the-cluster). Terraform
+> cannot do it: it would need API-server credentials that do not exist until kubeadm
+> has run.
+
+> **Shared AWS account.** 228281126655 is shared with the course — `aws s3 ls` shows
+> classmates' state buckets. Every resource here is tagged `Project=recall` and
+> prefixed `shahdra-recall-`. Never delete AWS resources by a broad tag filter; the
+> destroy procedure in [§7](#7-destroy) is scoped to Recall's own ids.
 
 ---
 
-## 0. What this creates
+## 0. What gets created
 
-13 resources, all tagged `Project=recall` and prefixed `shahdra-recall-`:
+**`Plan: 50 to add, 0 to change, 0 to destroy.`** — verified with
+`terraform plan` against the live AWS API on 2026-08-13, provider `hashicorp/aws`
+v6.59.0.
 
-| Resource | Name |
-|---|---|
-| DynamoDB table | `shahdra-recall-Cards` (+ `due-index` GSI) |
-| DynamoDB table | `shahdra-recall-Decks` |
-| DynamoDB table | `shahdra-recall-LearnerProfile` |
-| S3 bucket | `shahdra-recall-us-east-1-uploads-228281126655` |
-| SNS topic | `shahdra-recall-us-east-1-reminders` |
-| IAM user + inline policy | `shahdra-recall-us-east-1-app` |
-| S3 config | public-access-block, SSE, versioning, lifecycle |
-| Guard | `terraform_data.workspace_region_guard` (no AWS resource) |
+Everything carries `Owner=shahdra`, `Project=recall`, `ManagedBy=terraform`,
+`TFWorkspace=us-east-1` via the provider's `default_tags`.
+
+### Data plane — 13 resources
+
+| # | Resource | Name |
+|---|---|---|
+| 3 | DynamoDB tables | `shahdra-recall-Cards` (with `due-index` GSI), `shahdra-recall-Decks`, `shahdra-recall-LearnerProfile` |
+| 1 | S3 bucket | `shahdra-recall-us-east-1-uploads-228281126655` |
+| 4 | S3 config | public-access-block, SSE-S3, versioning, lifecycle (expire uploads after 90d) |
+| 1 | SNS topic | `shahdra-recall-us-east-1-reminders` |
+| 1 | SNS topic policy | restricts publish to the app user |
+| 2 | IAM | user `shahdra-recall-us-east-1-app` + its inline policy |
+| 1 | Guard | `terraform_data.workspace_region_guard` — no AWS resource, just a precondition |
 
 Table names carry no region; the bucket and topic do. Tables are already
-region-scoped and one set serves both `dev` and `prod`, so the region would be
-noise — whereas an S3 bucket name is globally unique and needs every
-disambiguator it can get.
+region-scoped and one set serves both `dev` and `prod`, so a region in the name would
+be noise — whereas an S3 bucket name is globally unique and needs every
+disambiguator available.
+
+### VPC — 11 resources
+
+| # | Resource | Detail |
+|---|---|---|
+| 1 | VPC | `shahdra-recall-us-east-1-vpc`, `10.0.0.0/16`, DNS hostnames + support on |
+| 2 | Public subnets | `10.0.101.0/24`, `10.0.102.0/24` — first two AZs, derived with `cidrsubnet()` |
+| 1 | Internet gateway | |
+| 1 | Route table + 1 route | `0.0.0.0/0` → IGW |
+| 2 | Route table associations | one per subnet |
+| 3 | Default VPC objects | default security group, route table, and NACL — adopted and locked down by the module, not newly created |
+
+**No private subnets and no NAT gateway.** A NAT would add ~$32/month for no benefit:
+every node needs outbound internet (apt, image pulls, Bedrock) *and* inbound NodePort
+access, so they belong in public subnets.
+
+### Cluster — 26 resources
+
+| # | Resource | Detail |
+|---|---|---|
+| 1 | EC2 instance | control plane, `t3.medium`, 30 GiB gp3 encrypted, in the first subnet |
+| 1 | Launch template | workers, `t3.medium`, 30 GiB gp3 encrypted, IMDSv2 required |
+| 1 | Auto Scaling Group | `shahdra-recall-us-east-1-workers`, desired 1 / min 1 / max 3, spans both subnets |
+| 2 | Security groups | one control plane, one worker |
+| 7 | Ingress rules | see below |
+| 2 | Egress rules | all outbound, both SGs |
+| 2 | IAM roles | control plane, worker |
+| 6 | Role policy attachments | EBS CSI + ECR + SSM Core on each role |
+| 2 | Inline role policies | SSM `PutParameter` (control plane) / `GetParameter` (worker), scoped to one parameter path |
+| 2 | Instance profiles | one per role |
+
+The **AMI is looked up, not hard-coded** — newest Ubuntu 22.04 LTS from Canonical in
+whatever region the provider points at, so the module works in any region unchanged.
+
+**The 7 ingress rules:**
+
+| Port(s) | Source | On |
+|---|---|---|
+| 22 | `ssh_ingress_cidr` | both SGs (2 rules) |
+| 6443 | `ssh_ingress_cidr` | control plane — the API server, for `kubectl` from your laptop |
+| all | `10.0.0.0/16` | both SGs (2 rules) — covers kubelet, etcd, and Calico VXLAN without enumerating ports, which is where CNI setups silently break |
+| 30300–30800 | `0.0.0.0/0` | workers — dev frontend + tutor-agent |
+| 31300–31800 | `0.0.0.0/0` | workers — prod frontend + tutor-agent |
+
+**Why both ports of each pair are open:** the browser calls tutor-agent *directly*,
+deriving its URL client-side as `frontendPort + 500`
+(`services/frontend/lib/api.ts`). Opening only the frontend port renders a working
+page whose every API request fails. **study-mcp is deliberately not exposed** — it is
+ClusterIP, reached only by tutor-agent inside the cluster, and publishing it would
+expose an unauthenticated tool API.
+
+### Created OUTSIDE Terraform
+
+These exist after a full deploy but Terraform does not manage them, which matters at
+destroy time:
+
+| Thing | Created by | Destroyed by Terraform? |
+|---|---|---|
+| SSM parameter `/recall/shahdra-recall-us-east-1/join-command` | control-plane user-data | **No** — delete by hand ([§7](#7-destroy)) |
+| IAM access keys for the app user | you, with the CLI ([§4](#4-one-time-app-access-keys)) | No — deleted with the user |
+| `recall-secrets` Kubernetes Secret | `bootstrap.sh` | N/A (dies with the cluster) |
+| Any EBS volume from a PVC | EBS CSI controller | **No** — orphaned, keeps billing ([§7](#7-destroy)) |
+| Calico / ArgoCD / app workloads | `bootstrap.sh` + ArgoCD | N/A (dies with the cluster) |
 
 ---
 
-## 1. One-time: create the state bucket
+## 1. Cost, and the two things that will bite you
 
-The backend block in `main.tf` names `shahdra-recall-tfstate-228281126655`.
-**This bucket must exist before `terraform init`.** Backend blocks permit no
-variables or interpolation, so Terraform cannot create the bucket that holds its
-own state — a chicken-and-egg problem solved out-of-band:
+**Roughly $0.07/hour ≈ $1.70/day ≈ $50/month** if left running: two `t3.medium`
+instances (~$0.0416/hr each in us-east-1) plus 60 GiB of gp3 (~$4.80/month). The data
+plane is on-demand DynamoDB and a nearly-empty bucket — cents.
+
+**A stopped control plane is unrecoverable.** `kubeadm init` bakes the instance's
+public IP into the API server certificate's SANs. Stop the instance and it comes back
+with a *different* public IP, which fails TLS verification on every `kubectl` call
+and on every worker's join. There is no fix short of `kubeadm reset` and re-init.
+
+**The course budget keeper will stop your instances.** A Lambda
+(`aws-learning-budget-keeper-function`) stops **every** EC2 instance in this account
+at **16:00 and 00:00 daily**. Combined with the point above: if you leave the cluster
+up past 16:00, expect to destroy and re-apply rather than start it again.
+
+Practical consequences:
+
+- **Do not "pause overnight" by stopping instances.** `terraform destroy` and
+  re-apply. A fresh cluster is ~15 minutes end to end; recovering a stopped one is
+  not possible.
+- **Apply the same day you demo**, ideally within a few hours of it.
+- To stop only the *worker* billing while keeping the control plane's certificate
+  valid: `terraform apply -var worker_desired_capacity=0`. The control plane still
+  bills and the budget keeper still stops it, so this is a partial measure at best.
+
+---
+
+## 2. One-time: prerequisites
+
+### 2a. The state bucket
+
+`main.tf`'s backend names `shahdra-recall-tfstate-228281126655`. **It must exist
+before `terraform init`** — backend blocks permit no variables or interpolation, so
+Terraform cannot create the bucket that holds its own state.
 
 ```bash
 aws s3 mb s3://shahdra-recall-tfstate-228281126655 --region us-east-1
@@ -54,92 +164,161 @@ aws s3api put-public-access-block \
     BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 ```
 
-**Alternative:** reuse the existing `shahdra-polyai-tfstate-228281126655` bucket by
-changing only the `bucket` line in `main.tf`'s backend block. The `key` is already
-`recall.tfstate`, distinct from the cluster's, so the two states cannot collide.
-One less bucket in a shared account, at the cost of coupling two projects' state
-lifetimes.
+### 2b. The SSH key pair
+
+`ssh_key_name` names an EC2 key pair that must **already exist**. Terraform does not
+create it: the private half would land in state, and state is not a secret store.
+
+```bash
+aws ec2 create-key-pair --key-name shahd-key \
+  --query KeyMaterial --output text > ~/.ssh/shahd-key.pem
+chmod 400 ~/.ssh/shahd-key.pem
+```
+
+If you already have the `.pem`, **verify it actually matches AWS's record** before
+applying — a mismatch is only discovered when SSH fails, by which point the cluster
+is built and unbootstrappable:
+
+```bash
+ssh-keygen -y -f ~/.ssh/shahd-key.pem
+aws ec2 describe-key-pairs --key-names shahd-key --include-public-key \
+  --query 'KeyPairs[0].PublicKey' --output text
+```
+
+The two must print the same `ssh-rsa AAAA...` string.
 
 ---
 
-## 2. Plan
+## 3. Apply
 
 ```bash
 cd infra/terraform
 terraform init
 
 # The workspace names the REGION, not the environment.
-terraform workspace new us-east-1   # first time; else: terraform workspace select us-east-1
+terraform workspace select us-east-1   # first time: terraform workspace new us-east-1
 
 cp tfvars/us-east-1.tfvars.example tfvars/us-east-1.tfvars
+# Edit it if your ssh_key_name differs from "shahd-key".
+
 terraform plan -var-file=tfvars/us-east-1.tfvars
 ```
 
-Expected: **`Plan: 13 to add, 0 to change, 0 to destroy.`**
+Expected: **`Plan: 50 to add, 0 to change, 0 to destroy.`**
 
-The `0 to change, 0 to destroy` half matters more than the 13. In a shared account,
-any line that is not `will be created` means this config is about to touch
-something that is not Recall's — stop and re-read it before going further.
+**The `0 to change, 0 to destroy` half matters more than the 50.** In a shared
+account, any line that is not `will be created` means this config is about to touch
+something that is not Recall's — stop and read it before going further.
 
-If the workspace and `region` disagree, the plan fails on a precondition rather
-than building a second, misnamed set of tables:
+If the workspace and `region` disagree, the plan fails on a precondition rather than
+building a second, misnamed set of resources:
 
 ```
 Workspace 'us-west-2' does not match region 'us-east-1'.
 Run: terraform workspace select us-east-1
 ```
 
-### Planning without the state bucket
-
-To validate against the live AWS API before creating any bucket, copy the config to
-a scratch directory and strip the backend block so state stays local:
-
-```bash
-rm -rf /tmp/recall-plan && mkdir -p /tmp/recall-plan
-cp infra/terraform/*.tf /tmp/recall-plan/
-cp infra/terraform/tfvars/us-east-1.tfvars.example /tmp/recall-plan/plan.tfvars
-cd /tmp/recall-plan
-python3 -c "
-import re
-s=open('main.tf').read()
-open('main.tf','w').write(re.sub(r'\n  backend \"s3\" \{.*?\n  \}\n','\n',s,flags=re.S))"
-terraform init && terraform workspace new us-east-1
-terraform plan -var-file=plan.tfvars
-```
-
-This is how the 13-resource plan above was verified. It creates nothing.
-
----
-
-## 3. Apply — **requires instructor approval**
+Then:
 
 ```bash
 terraform apply -var-file=tfvars/us-east-1.tfvars
-terraform output -json > /tmp/recall-outputs.json
+```
+
+**~3 minutes.** The EC2 instance returns as soon as it is *running*, not when it is
+*ready* — user-data then spends ~6–8 minutes installing cri-o, kubeadm, and running
+`kubeadm init`. Watch it:
+
+```bash
+ssh -i ~/.ssh/shahd-key.pem ubuntu@$(terraform output -raw control_plane_public_ip) \
+  'sudo tail -f /var/log/user-data.log'
+```
+
+Wait for `=== control-plane bootstrap COMPLETE ===`. Terraform's useful outputs:
+
+```bash
+terraform output ssh_command               # paste-ready SSH
+terraform output fetch_kubeconfig_command  # paste-ready scp
+terraform output recall_urls               # where the app will be
 ```
 
 ---
 
 ## 4. One-time: app access keys
 
-Terraform creates the IAM user but **not** its access keys, deliberately.
+Terraform creates the IAM user but **not** its access keys, deliberately:
 `aws_iam_access_key` writes the secret key into state in plaintext, and that state
-lives in an S3 bucket in a shared account. Mint them with the CLI:
+lives in a bucket in a shared account.
 
 ```bash
 aws iam create-access-key --user-name shahdra-recall-us-east-1-app
 ```
 
-Load the pair straight into the Kubernetes Secret — see
-`infra/k8s/<env>/secret.example.yaml`. Do not write them to a file in the repo.
+Put the pair into the env file that becomes the Kubernetes Secret — never into a file
+in the repo:
 
-To rotate: create the second key, update the Secret, restart the pods, confirm
-healthy, then delete the old key. IAM allows two keys per user precisely so
+```bash
+cat > /tmp/recall.env <<EOF
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+DEEPGRAM_API_KEY=$(grep '^DEEPGRAM_API_KEY=' ../../services/tutor-agent/.env | cut -d= -f2-)
+EOF
+```
+
+Static keys rather than a role because this is kubeadm on EC2 with **no OIDC
+provider** — there is no IRSA, and the worker instance role grants only SSM and ECR.
+
+To rotate: create the second key, update the Secret, `kubectl rollout restart`,
+confirm healthy, then delete the old key. IAM allows two keys per user precisely so
 rotation needs no downtime.
 
 ---
 
-## 5. One-time: subscribe to the reminder topic
+## 5. Bootstrap the cluster
+
+Without this, `kubectl get nodes` shows `NotReady` and nothing schedules.
+
+```bash
+CP=$(terraform output -raw control_plane_public_ip)
+
+scp -i ~/.ssh/shahd-key.pem /tmp/recall.env ubuntu@$CP:/tmp/recall.env
+ssh -i ~/.ssh/shahd-key.pem ubuntu@$CP \
+  "RECALL_ENV_FILE=/tmp/recall.env bash -s" < ../k8s/bootstrap.sh
+```
+
+**~5 minutes.** It installs Calico (VXLAN), the EBS CSI driver, the `dev`/`prod`/`argocd`
+namespaces, `recall-secrets` in both app namespaces, ArgoCD, and the two ArgoCD
+Applications. It is idempotent — safe to re-run if it fails halfway.
+
+Then get a kubeconfig on your laptop:
+
+```bash
+eval "$(terraform output -raw fetch_kubeconfig_command)"
+export KUBECONFIG=~/.kube/config-recall
+kubectl get nodes
+```
+
+It writes `~/.kube/config-recall`, not `~/.kube/config`, so it cannot clobber an
+existing context.
+
+**The worker takes ~6–8 minutes from launch to appear** (cri-o install, then
+`kubeadm join` after polling SSM for the join command). `kubectl get nodes -w` until
+it shows `Ready`.
+
+### The dev branch must exist
+
+`recall-dev.yaml` tracks the `dev` branch. Until it exists ArgoCD reports
+`ComparisonError` — that is the missing branch, not a broken manifest:
+
+```bash
+git push origin implementation:dev
+```
+
+`recall-prod` is **manual-sync by design** — the promotion gate. It shows `OutOfSync`
+until you run `argocd app sync recall-prod`.
+
+---
+
+## 6. One-time: subscribe to the reminder topic
 
 There is no `aws_sns_topic_subscription` resource. An email subscription only goes
 live when the recipient clicks a confirmation link, which Terraform cannot do — the
@@ -152,39 +331,116 @@ aws sns subscribe \
   --notification-endpoint you@example.com
 ```
 
-Then click the link in the confirmation email. Verify:
+Click the link in the confirmation email, then verify:
 
 ```bash
 aws sns list-subscriptions-by-topic \
   --topic-arn "$(terraform output -raw reminders_topic_arn)"
 ```
 
-`SubscriptionArn` still reading `PendingConfirmation` means the link was not
-clicked, and the daily digest will publish successfully to nobody.
+`SubscriptionArn` still reading `PendingConfirmation` means the link was not clicked,
+and the daily digest will publish successfully to nobody.
 
 ---
 
-## 6. Wire the outputs into Kubernetes
+## 7. Destroy
 
-The bucket and topic names are not guessable — they embed the account id and
-region. Copy them from Terraform rather than typing them:
+**Order matters.** Doing this out of order leaves orphaned EBS volumes that keep
+billing and that `terraform destroy` cannot see.
+
+### 7a. Delete PVCs first — only if you created any
+
+Volumes provisioned by the EBS CSI driver are created by the *controller*, not by
+Terraform, so they are invisible to `terraform destroy` and survive it.
+
+Recall's four workloads are stateless (state is in DynamoDB), so there is normally
+nothing here. Check anyway:
 
 ```bash
-terraform output -json \
-  | jq -r '.configmap_env.value | to_entries[] | "\(.key)=\(.value)"'
+kubectl get pvc --all-namespaces
+# If any exist:
+kubectl delete pvc --all -n <namespace>
 ```
 
-Those six lines are the `data:` block of `infra/k8s/<env>/configmap.yaml`.
+Wait for the corresponding volumes to disappear from
+`aws ec2 describe-volumes --filters Name=status,Values=available` before continuing.
+
+### 7b. Destroy
+
+```bash
+cd infra/terraform
+terraform destroy -var-file=tfvars/us-east-1.tfvars
+```
+
+**~5 minutes.** Read the plan before confirming.
+
+**This deletes all data.** The three DynamoDB tables and every card and review
+history in them, plus the uploads bucket and its contents. There is no backup:
+`point_in_time_recovery` defaults to `false`.
+
+`prevent_destroy` is **off** on the tables and the bucket, and `force_destroy` is on
+for the bucket, specifically so this command works. That means the plan no longer
+stops you — **read it.** A `replace` or `destroy` on any of the three tables means
+data loss, and a typo in `owner` or `table_name_prefix` produces exactly that plan
+(names derive from those variables, and DynamoDB cannot rename in place).
+
+`force_destroy` is required, not cosmetic: versioning is enabled on the uploads
+bucket, so even after deleting every object the bucket still holds old versions and
+delete markers, and `BucketNotEmpty` would fail the destroy at the very last step.
+
+### 7c. Clean up what Terraform cannot
+
+**The SSM join-command parameter** — written by the control plane at boot, so
+Terraform never knew about it:
+
+```bash
+aws ssm delete-parameter \
+  --name "$(terraform output -raw join_command_ssm_parameter)" \
+  --region us-east-1
+```
+
+Run this *before* `terraform destroy` if you want the output to still resolve;
+otherwise the path is `/recall/shahdra-recall-us-east-1/join-command`.
+
+Harmless if left behind (a SecureString parameter is free at this scale), but it is
+stale data in a shared account, and a stale join command naming a dead IP is exactly
+what the worker user-data's liveness probe exists to survive.
+
+**Verify nothing of Recall's is left**, scoped to our own tag so a classmate's
+resources are never in view:
+
+```bash
+aws ec2 describe-instances \
+  --filters "Name=tag:Project,Values=recall" "Name=instance-state-name,Values=running,stopped" \
+  --query 'Reservations[].Instances[].[InstanceId,State.Name,Tags[?Key==`Name`].Value|[0]]' \
+  --output table
+
+aws ec2 describe-volumes \
+  --filters "Name=status,Values=available" "Name=tag:Project,Values=recall" \
+  --query 'Volumes[].[VolumeId,Size,CreateTime]' --output table
+```
+
+> **Never bulk-delete EBS volumes in this account.** It holds 60+ `available` volumes
+> belonging to other students. Delete only by the specific ids the
+> `Project=recall`-filtered query above returns.
+
+### 7d. What destroy does NOT touch
+
+- **The state bucket** `shahdra-recall-tfstate-228281126655` — it holds the state
+  doing the destroying. Delete it manually if you are done for good (`aws s3 rb
+  --force`).
+- **The `shahd-key` EC2 key pair** — created out-of-band, reusable.
+- **The IAM access keys** — deleted along with the user.
 
 ---
 
 ## Keeping local and production in sync
 
-`scripts/setup-local-dynamodb.sh` creates the same three tables in DynamoDB Local
-and says of itself:
+`scripts/setup-local-dynamodb.sh` creates the same three tables in DynamoDB Local and
+says of itself:
 
-> Key schemas here must match `infra/terraform/dynamodb.tf`. If they drift, local
-> runs pass while production breaks.
+> Key schemas here must match `infra/terraform/dynamodb.tf`. If they drift, local runs
+> pass while production breaks.
 
 The schema, verified against `services/study-mcp/storage.py`:
 
@@ -194,39 +450,83 @@ The schema, verified against `services/study-mcp/storage.py`:
 | Decks | `user_id` (S) | `deck_id` (S) | — |
 | LearnerProfile | `user_id` (S) | — | — |
 
-Three details that are load-bearing:
+Three load-bearing details:
 
-- **`due_date` is a String, not a Number.** `query_due_cards`
-  (`storage.py:133`) filters with `.lte()` and relies on ISO dates sorting
-  lexicographically.
+- **`due_date` is a String, not a Number.** `query_due_cards` (`storage.py:133`)
+  filters with `.lte()` and relies on ISO dates sorting lexicographically.
 - **Projection must be `ALL`.** `_normalize_card` (`storage.py:89`) reads
-  `ease_factor` / `interval_days` / `repetitions` off each returned item;
-  `KEYS_ONLY` would turn one Query into N+1 round trips.
+  `ease_factor` / `interval_days` / `repetitions` off each returned item; `KEYS_ONLY`
+  would turn one Query into N+1 round trips.
 - **The GSI partitions on `user_id`, not `due_date`.** `docs/spec.md:143` reads the
   other way; the code is the authority, and `docs/plan.md:823` agrees.
 
+---
+
 ## Gotchas
 
+### Data plane
+
 - **A Query against a GSI is authorized against the index ARN, not the table's.**
-  `iam.tf` includes `${table.arn}/index/*`. Without that one line the app starts
-  fine, decks list fine, and every study session fails with
-  `AccessDeniedException`. `terraform output cards_due_index_arn` is the value to
-  check first.
-- **Bedrock's `us.` prefix means a cross-region inference profile.** It needs both
-  the profile ARN *and* the foundation-model ARN in every region it may route to
+  `iam.tf` includes `${table.arn}/index/*`. Without that one line the app starts fine,
+  decks list fine, and every study session fails with `AccessDeniedException`.
+  `terraform output cards_due_index_arn` is the value to check first.
+- **Bedrock's `us.` prefix means a cross-region inference profile.** It needs both the
+  profile ARN *and* the foundation-model ARN in every region it may route to
   (`us-east-1`, `us-east-2`, `us-west-2` — all three are in `iam.tf`). Granting only
   the calling region fails *intermittently*, when the profile happens to route
   elsewhere.
 - **`bedrock-restrict-developers` carries an explicit deny** for models outside its
   eight-model allowlist. An explicit deny always wins, so no policy here can grant
   around it. Both models in `iam.tf` are on the allowlist.
-- **Publishing to the topic needs KMS.** It is encrypted with `alias/aws/sns`, so
-  the publisher needs `kms:GenerateDataKey`; without it the failure reads like an
-  SNS permission problem.
-- **The three tables and the bucket carry `prevent_destroy`.** Removing a learner's
-  review history should take a deliberate edit, not a stray `terraform destroy`.
-  To delete on purpose: drop the `lifecycle` block, apply, then destroy.
-- **`.terraform.lock.hcl` is currently gitignored** (`.gitignore:36`) — flagged, not
+- **Publishing to the topic needs KMS.** It is encrypted with `alias/aws/sns`, so the
+  publisher needs `kms:GenerateDataKey`; without it the failure reads like an SNS
+  permission problem.
+
+### Cluster
+
+- **`prevent_destroy` cannot be driven by a variable.** Terraform rejects any
+  expression in a `lifecycle` block — `Variables may not be used here`. So a
+  `-var allow_destroy=true` switch is not possible; the guard is on or off in
+  committed code. It is currently **off** on all four data resources, with the
+  reasoning in `dynamodb.tf`. `force_destroy` is an ordinary argument and *can* be
+  variable-driven if the guard is ever wanted back.
+- **Editing a user-data template replaces the instance.** `user_data` runs only on
+  first boot, so `user_data_replace_on_change = true` is set. Without it, editing the
+  script yields a successful apply that changes nothing on the box. For the control
+  plane, replacement means a **new cluster** — every worker must rejoin.
+- **`kubernetes_version` must be a MINOR version** (`v1.30`, not `v1.30.4`). It
+  selects the `pkgs.k8s.io` apt repository, which is published per minor line; a patch
+  string makes the apt source 404 and the boot fails. A validation block catches it at
+  plan time.
+- **`vpc_cidr` must not overlap `pod_network_cidr`.** Node IPs and pod IPs in the same
+  range break routing in ways that look like random pod-to-pod timeouts.
+- **Calico must use `encapsulation: VXLAN`, not upstream's `VXLANCrossSubnet`.**
+  Cross-subnet sends raw pod-IP packets when two nodes share a subnet, and AWS drops
+  those (no VPC route for the pod CIDR, and the ENI source/dest check rejects them).
+  `bootstrap.sh` applies the Installation CR inline for exactly this reason.
+- **Provider-level `default_tags` do not reach ASG-launched instances.** The ASG
+  repeats `Owner`, `Project`, and `Cluster` in `tag { propagate_at_launch = true }`
+  blocks, and the launch template repeats `Name`/`Role` in `tag_specifications`. Both
+  are needed; neither is redundant.
+- **Scaling down does not remove the Node object.** After the ASG terminates a worker,
+  `kubectl delete node <name>` is manual. A terminating lifecycle hook plus a Lambda
+  would automate it, at the cost of machinery harder to explain than the manual step.
+- **`.terraform.lock.hcl` is currently gitignored** (`.gitignore:37`) — flagged, not
   changed. The provider is pinned `~> 6.0` in `main.tf` so an unpinned major bump
-  cannot happen silently, but committing the lock file is what pins the exact
-  patch. The reference project commits its lock file.
+  cannot happen silently, but committing the lock file is what pins the exact patch.
+  `.gitignore:34` also ignores `*.tfvars` (with an `!*.tfvars.example` exception on
+  line 35), which is why the committed file is `tfvars/us-east-1.tfvars.example`.
+
+### Troubleshooting a cluster that does not come up
+
+| Symptom | Check |
+|---|---|
+| SSH times out | Instance still booting (~1 min), or `ssh_ingress_cidr` does not include your address: `curl -s https://checkip.amazonaws.com` |
+| `kubectl` refused on 6443 | `kubeadm init` has not finished. `sudo tail -50 /var/log/user-data.log` on the control plane |
+| Nodes `NotReady` | `bootstrap.sh` has not run, or Calico failed: `kubectl -n tigera-operator logs deploy/tigera-operator` |
+| Worker never appears | `aws ssm get-parameter --name /recall/shahdra-recall-us-east-1/join-command --with-decryption` — then `sudo tail -50 /var/log/user-data.log` on the worker |
+| Pods `CreateContainerConfigError` | `recall-secrets` missing: `kubectl -n dev get secret recall-secrets`. Re-run `bootstrap.sh` |
+| Pods `ImagePullBackOff` | Images not pushed yet, or the manifest's tag does not exist. `kubectl -n dev describe pod <name>` |
+| ArgoCD `ComparisonError` | The `dev` branch does not exist: `git push origin implementation:dev` |
+| App loads, every request fails | tutor-agent's NodePort unreachable. Both ports of the pair must be open — the browser calls it directly at `frontendPort + 500` |
+| tutor-agent reports `mcp_tools: 0` | It discovers tools once at startup with no retry. study-mcp was down when it booted: `kubectl -n dev rollout restart deploy/tutor-agent` |
