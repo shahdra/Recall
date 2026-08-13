@@ -1,0 +1,80 @@
+# ArgoCD Application — Recall in the dev namespace.
+#
+# One Application per environment rather than the app-of-apps fan-out the
+# reference project uses: Recall has four workloads all released together, so
+# per-service Applications would add a layer of indirection without buying
+# independent sync. `directory.recurse` walks infra/k8s/dev and applies every
+# manifest under it.
+#
+# Apply once by hand (ArgoCD manages everything after that):
+#   kubectl apply -f infra/argo/recall-dev.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: recall-dev
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: recall
+  # Without this finalizer, deleting the Application orphans the running
+  # workloads — they keep serving with nothing managing them.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/shahdra/Recall.git
+
+    # Dev deploys from the `dev` branch, prod from `main`. The branch IS the
+    # promotion mechanism: merging dev -> main is what makes a change eligible
+    # for prod.
+    #
+    # NOTE: the `dev` branch does not exist yet. Until it is pushed, this
+    # Application reports ComparisonError rather than syncing:
+    #   git push origin implementation:dev
+    targetRevision: dev
+
+    path: infra/k8s/dev
+
+    directory:
+      # Descend into study-mcp/, tutor-agent/, frontend/ and reminder/, and pick
+      # up configmap.yaml at the top level.
+      recurse: true
+
+      # NOTE: everything under infra/k8s/dev is synced, with no exclude pattern —
+      # by design. The Secret TEMPLATES (whose values are literally "REPLACE_ME")
+      # live outside this tree in infra/k8s/secrets-templates/ precisely so they
+      # cannot be synced. Relying on an `exclude` glob to protect production
+      # credentials would put a rename or a new secret-*.yaml one typo away from
+      # overwriting the real recall-secrets with placeholders.
+      #
+      # The real Secret is created out-of-band and is not in git. `prune: true`
+      # does not touch it: ArgoCD only prunes resources it tracks, and a Secret it
+      # never applied is not tracked.
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: dev
+
+  syncPolicy:
+    automated:
+      # Dev auto-syncs on every push to the dev branch — that is the point of
+      # having a dev environment.
+      prune: true
+      # Reverts manual `kubectl edit`s back to git. Occasionally annoying while
+      # debugging (use `kubectl scale`'s ignoreDifferences or suspend the app
+      # instead), but it is what makes git the actual source of truth.
+      selfHeal: true
+
+    syncOptions:
+      - CreateNamespace=true
+      # Apply order: ConfigMap before the Deployments that mount it, so a pod
+      # never starts against stale config on a fresh namespace.
+      - ApplyOutOfSyncOnly=true
+
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

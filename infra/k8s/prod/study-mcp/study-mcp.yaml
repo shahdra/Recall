@@ -1,0 +1,115 @@
+# study-mcp (prod namespace) — the MCP server holding all card storage and the
+# SM-2 scheduler.
+#
+# ClusterIP, not NodePort: only the tutor-agent talks to it, and it has no
+# authentication of its own. Exposing card storage on a node port would put an
+# unauthenticated read/write API for every learner's data on the public internet.
+#
+# No HPA. It exposes no /metrics endpoint to scale on request rate, and it is not
+# the bottleneck — the tutor-agent's Bedrock calls dominate every request. CPU-based
+# scaling on a service whose work is a DynamoDB round trip would mostly scale on
+# noise.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: study-mcp
+  namespace: prod
+  labels:
+    app: study-mcp
+    app.kubernetes.io/part-of: recall
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: study-mcp
+  template:
+    metadata:
+      labels:
+        app: study-mcp
+        app.kubernetes.io/part-of: recall
+    spec:
+      # Pod-level securityContext so it also covers any future initContainer.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001 # `recall` in services/study-mcp/Dockerfile
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: study-mcp
+          # Pinned by commit SHA, never `latest`. A mutable tag makes the running
+          # code unknowable and breaks rollback: `kubectl rollout undo` would
+          # return to the same tag now pointing at different bytes.
+          image: shahdra/recall-study-mcp:6689d49
+          ports:
+            - name: http
+              containerPort: 9000
+          envFrom:
+            - configMapRef:
+                name: recall-config
+            - secretRef:
+                name: recall-secrets
+          # Probes hit /health, NOT /mcp. The /mcp path speaks the MCP
+          # streamable-http protocol and expects a session handshake — a plain GET
+          # there does not return a meaningful status, so probing it would report
+          # a healthy server as failing.
+          #
+          # /health returns 200 without touching AWS, which makes this a liveness
+          # signal for the process only: it stays 200 if DynamoDB is unreachable.
+          # That is the right call for liveness (restarting the pod cannot fix
+          # DynamoDB) but it means a green probe does not prove storage works.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 3
+            failureThreshold: 20 # ~60s; boot is just the Python import
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              # No CPU limit on purpose: CFS throttling adds latency to a service
+              # that is on the critical path of every graded answer, and the
+              # request already guarantees its share. Memory IS capped, because a
+              # leak has no natural ceiling.
+              memory: 256Mi
+          securityContext:
+            readOnlyRootFilesystem: true # writes nothing to disk
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: study-mcp
+  namespace: prod
+  labels:
+    app: study-mcp
+    app.kubernetes.io/part-of: recall
+spec:
+  # The Service name must stay `study-mcp`: STUDY_MCP_URL in the ConfigMap is
+  # http://study-mcp:9000/mcp, matching the default compiled into the agent
+  # (services/tutor-agent/app.py:50). Renaming this breaks tool discovery, and the
+  # agent degrades silently to zero tools rather than crashing.
+  type: ClusterIP
+  selector:
+    app: study-mcp
+  ports:
+    - name: http
+      port: 9000
+      targetPort: http

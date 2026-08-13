@@ -1,0 +1,87 @@
+# Daily reminder digest (prod namespace) — docs/spec.md:226, Flow C.
+#
+# Counts cards due today across all learners and publishes one SNS message. See
+# services/reminder/reminder.py for why the digest is aggregate rather than
+# per-learner (there is no auth, so a learner id has no email address).
+#
+# THIS IS THE ONE THAT SHOULD RUN. dev and prod read the SAME DynamoDB tables and
+# publish to the SAME SNS topic, so both CronJobs enabled means two identical
+# digests every morning. The dev copy is therefore SUSPENDED (suspend: true) and
+# this one is live. Flip the pair if you need to test a change to the job — do not
+# unsuspend both.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: reminder
+  namespace: prod
+  labels:
+    app: reminder
+    app.kubernetes.io/part-of: recall
+spec:
+  # 08:00 UTC daily. Kubernetes CronJob schedules are interpreted in UTC unless
+  # spec.timeZone is set, so this is NOT 08:00 local — deliberately left in UTC so
+  # the schedule does not shift under daylight saving.
+  schedule: "0 8 * * *"
+
+  # Live in prod. The dev copy is suspended so only one digest is sent per day.
+  suspend: false
+
+  # If a run somehow overruns 24h, skip the next rather than stacking a second
+  # pod: two concurrent runs would publish two digests for the same day.
+  concurrencyPolicy: Forbid
+
+  # A missed window (node down, cluster upgrade) should be skipped, not
+  # back-filled. Yesterday's "cards due today" is wrong by the time it sends.
+  startingDeadlineSeconds: 3600
+
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
+  jobTemplate:
+    spec:
+      # Two attempts total. The likely failures are a transient DynamoDB or SNS
+      # blip, which a retry fixes; a misconfigured topic ARN fails identically
+      # every time, and retrying it 6 times (the default) just delays the red
+      # status without changing it.
+      backoffLimit: 1
+
+      # Bound the run so a hung request cannot leave a pod alive until the next
+      # firing, which `concurrencyPolicy: Forbid` would then silently skip.
+      activeDeadlineSeconds: 600
+
+      template:
+        metadata:
+          labels:
+            app: reminder
+            app.kubernetes.io/part-of: recall
+        spec:
+          # Never Always: a CronJob pod that restarts forever would republish the
+          # digest on every restart. OnFailure retries the container in place;
+          # backoffLimit above caps the total attempts.
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001 # `recall` in services/reminder/Dockerfile
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: reminder
+              image: shahdra/recall-reminder:6689d49
+              envFrom:
+                - configMapRef:
+                    name: recall-config # tables + RECALL_SNS_TOPIC_ARN + AWS_REGION
+                - secretRef:
+                    name: recall-secrets # AWS keys
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 128Mi
+              securityContext:
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]

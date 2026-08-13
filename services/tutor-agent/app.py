@@ -1,0 +1,666 @@
+"""tutor-agent: Recall's orchestrator and HTTP API.
+
+Three things meet here. The **orchestrator** runs the hand-written ReAct loop over
+the tools it can reach. The two **sub-agents** (Card-Generator and Grader) are
+exposed to that loop *as tools*, so the orchestrator decides when to generate
+cards or grade an answer without knowing how either works. And **study-mcp**'s
+tools are discovered over MCP at startup and added to the same registry.
+
+The deck and session endpoints drive that machinery directly rather than through
+the LLM: creating a deck is a fixed pipeline (parse, store, generate, persist),
+and a fixed pipeline should not depend on a model choosing to follow it. ``/chat``
+is where the orchestrator gets to reason freely.
+
+Every external call is wrapped, and errors come back as
+``{error, code, request_id}`` — never a traceback.
+"""
+
+import base64
+import binascii
+import logging
+import os
+import uuid
+from contextlib import asynccontextmanager
+
+import boto3
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from langchain_core.tools import tool
+from prometheus_fastapi_instrumentator import Instrumentator
+from pydantic import BaseModel, Field
+
+import metrics
+from agent_loop import arun_agent
+from card_generator import generate_cards
+from grader import grade_answer
+from ingest import IngestError, extract_text
+from llm import build_llm
+from prompts import build_system_prompt
+from voice import VoiceUnavailable, build_client, transcribe
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+S3_BUCKET = os.environ.get("RECALL_S3_BUCKET", "")
+STUDY_MCP_URL = os.environ.get("STUDY_MCP_URL", "http://study-mcp:9000/mcp")
+
+# Populated at startup. Module-level so tests can replace them wholesale.
+LLM = None
+MCP_TOOLS: dict = {}
+VOICE_CLIENT = None
+
+def _s3_client():
+    return boto3.client("s3", region_name=AWS_REGION)
+
+
+# --- sub-agents exposed to the orchestrator as tools --------------------------
+
+
+@tool
+def generate_cards_tool(material: str) -> str:
+    """Turn study material into flashcards. Returns the cards as JSON."""
+    cards = generate_cards(material, LLM)
+    return str(cards)
+
+
+@tool
+def grade_answer_tool(question: str, correct_answer: str, student_answer: str) -> str:
+    """Grade a student's answer against the correct one. Returns a JSON verdict."""
+    return str(grade_answer(question, correct_answer, student_answer, LLM))
+
+
+# LangChain derives a tool's name from the function name; the plan pins the names
+# the orchestrator sees, so set them explicitly.
+generate_cards_tool.name = "generate_cards"
+grade_answer_tool.name = "grade_answer"
+
+SUB_AGENT_TOOLS = {
+    "generate_cards": generate_cards_tool,
+    "grade_answer": grade_answer_tool,
+}
+
+
+async def _discover_mcp_tools() -> dict:
+    """Discover study-mcp's tools over MCP.
+
+    A failure here is logged and swallowed: the agent runs with a reduced toolset
+    rather than refusing to start, so ``/health`` stays up and the operator can
+    see what is missing.
+    """
+    try:
+        from langchain_mcp_adapters.client import MultiServerMCPClient
+
+        client = MultiServerMCPClient(
+            {"study": {"url": STUDY_MCP_URL, "transport": "streamable_http"}}
+        )
+        tools = await client.get_tools()
+        discovered = {t.name: t for t in tools}
+        logger.info("discovered %d study-mcp tools: %s",
+                    len(discovered), sorted(discovered))
+        return discovered
+    except Exception:
+        logger.exception(
+            "could not reach study-mcp at %s; running with reduced tools", STUDY_MCP_URL
+        )
+        return {}
+
+
+def _build_llm_or_none():
+    """Build the chat model, or None if no model is reachable.
+
+    Returning None rather than raising keeps the process alive so ``/health`` can
+    report the problem — a pod that crash-loops tells an operator far less.
+    """
+    try:
+        return build_llm()
+    except Exception:
+        logger.exception("could not initialize any language model")
+        return None
+
+
+def _build_voice_or_none():
+    """Build the Deepgram client, or None if voice is unavailable."""
+    try:
+        client = build_client()
+        logger.info("voice transcription enabled")
+        return client
+    except VoiceUnavailable:
+        logger.warning("DEEPGRAM_API_KEY not set; voice answers disabled")
+    except Exception:
+        logger.exception("voice client failed to initialize; voice answers disabled")
+    return None
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    global LLM, MCP_TOOLS, VOICE_CLIENT
+
+    LLM = _build_llm_or_none()
+    MCP_TOOLS = await _discover_mcp_tools()
+    VOICE_CLIENT = _build_voice_or_none()
+
+    yield
+
+
+app = FastAPI(title="Recall tutor-agent", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Adds /metrics plus request rate, latency, and error-rate series per endpoint.
+Instrumentator().instrument(app).expose(app, include_in_schema=False)
+
+# Tracks how much of the model's own failure tally has been forwarded to
+# Prometheus, since counters can only be incremented by a delta.
+_LLM_COUNTER_STATE: dict = {}
+
+
+# --- error handling -----------------------------------------------------------
+
+
+class ApiError(Exception):
+    """An error we can explain to the user."""
+
+    def __init__(self, message: str, status_code: int = 400, code: str = "bad_request"):
+        super().__init__(message)
+        self.message = message
+        self.status_code = status_code
+        self.code = code
+
+
+@app.exception_handler(ApiError)
+async def _api_error_handler(request: Request, exc: ApiError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.message,
+            "code": exc.code,
+            "request_id": request.headers.get("x-request-id", str(uuid.uuid4())),
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error_handler(request: Request, exc: Exception):
+    """Log the detail, tell the user nothing internal."""
+    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
+    logger.exception("unhandled error (request_id=%s)", request_id)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Something went wrong on our end. Please try again.",
+            "code": "internal_error",
+            "request_id": request_id,
+        },
+    )
+
+
+def _require_tool(name: str):
+    tool_obj = MCP_TOOLS.get(name)
+    if tool_obj is None:
+        raise ApiError(
+            "The study service is unavailable right now. Please try again shortly.",
+            status_code=503,
+            code="mcp_unavailable",
+        )
+    return tool_obj
+
+
+class ToolCallFailed(Exception):
+    """A study-mcp tool reported a failure in its result rather than raising."""
+
+
+_TOOL_ERROR_PREFIX = "Error calling tool"
+
+
+def _unwrap_tool_result(raw):
+    """Normalize an MCP tool result into a Python object.
+
+    MCP returns content blocks — ``[{"type": "text", "text": "{...}"}]`` — rather
+    than a bare value, so unwrap the text block and parse it. Plain dicts and JSON
+    strings are passed through so fakes and future adapters both work.
+
+    Raises:
+        ToolCallFailed: If the tool reported an error. FastMCP surfaces failures
+            as a *successful* response whose text begins "Error calling tool",
+            so a tolerant parser silently turns a failed write into an empty
+            dict. That made /decks answer ``card_count: 15`` while every write
+            had failed — the API claiming success for work that never happened.
+    """
+    import json
+
+    if isinstance(raw, dict):
+        return raw
+
+    if isinstance(raw, list):
+        texts = [
+            block.get("text", "")
+            for block in raw
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        if not texts:
+            return raw  # a list of real values, not content blocks
+        raw = "\n".join(texts)
+
+    if isinstance(raw, str):
+        if raw.startswith(_TOOL_ERROR_PREFIX):
+            raise ToolCallFailed(raw[:300])
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("tool returned non-JSON text: %r", raw[:200])
+            return {}
+
+    return {}
+
+
+async def _call_tool(name: str, **kwargs) -> dict:
+    """Call an MCP tool and parse its result.
+
+    Async because MCP tools from langchain-mcp-adapters are async-only: their
+    sync ``invoke`` raises ``NotImplementedError``.
+    """
+    tool_obj = _require_tool(name)
+    try:
+        raw = await tool_obj.ainvoke(kwargs)
+        return _unwrap_tool_result(raw)
+    except ApiError:
+        raise
+    except Exception as exc:
+        logger.exception("study-mcp tool %s failed", name)
+        raise ApiError(
+            "The study service had trouble with that. Please try again.",
+            status_code=502,
+            code="mcp_error",
+        ) from exc
+
+
+async def _load_profile(user_id: str) -> dict:
+    """Read a learner's profile, tolerating an unavailable study service.
+
+    Personalization is worth degrading for: a tutor with no memory still tutors,
+    so a missing profile returns ``{}`` rather than failing the turn.
+    """
+    if "get_profile" not in MCP_TOOLS:
+        return {}
+    try:
+        return await _call_tool("get_profile", user_id=user_id)
+    except Exception:
+        logger.warning("could not load learner profile for %s", user_id, exc_info=True)
+        return {}
+
+
+UNTITLED_DECK = "Untitled deck"
+"""Shown when a card's deck has no title, or the deck lookup failed. A card with
+an odd label is still studiable; a session that 500s is not."""
+
+
+async def _deck_titles(user_id: str) -> dict[str, str]:
+    """Map deck_id to title, or ``{}`` if the decks cannot be read.
+
+    Cards carry ``deck_id`` (their partition key) but not the human-readable
+    title, which lives in the Decks table. Degrades like ``_load_profile``: a
+    label is a convenience, so losing it must not cost the session.
+    """
+    if "list_decks" not in MCP_TOOLS:
+        return {}
+    try:
+        result = await _call_tool("list_decks", user_id=user_id)
+    except Exception:
+        logger.warning("could not load deck titles for %s", user_id, exc_info=True)
+        return {}
+
+    titles = {}
+    for deck in result.get("decks") or []:
+        if not isinstance(deck, dict):
+            continue
+        deck_id = deck.get("deck_id")
+        title = (deck.get("title") or "").strip()
+        if deck_id:
+            titles[str(deck_id)] = title or UNTITLED_DECK
+    return titles
+
+
+def _label_decks(cards: list, titles: dict[str, str]) -> list[dict]:
+    """Stamp ``deck_title`` on each card and summarize the decks represented.
+
+    Returns one entry per deck that actually has a card due — the study view's
+    dropdown should never offer a deck with nothing in it. Ordered by due count
+    descending so the client can advance to the heaviest deck without re-sorting.
+    """
+    counts: dict[str, int] = {}
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        deck_id = str(card.get("deck_id") or "")
+        card["deck_title"] = titles.get(deck_id) or UNTITLED_DECK
+        counts[deck_id] = counts.get(deck_id, 0) + 1
+
+    return [
+        {
+            "deck_id": deck_id,
+            "title": titles.get(deck_id) or UNTITLED_DECK,
+            "due_count": count,
+        }
+        # Ties broken by title so the order is stable rather than dict-insertion
+        # dependent, which would reshuffle the dropdown between sessions.
+        for deck_id, count in sorted(
+            counts.items(),
+            key=lambda pair: (-pair[1], titles.get(pair[0]) or UNTITLED_DECK),
+        )
+    ]
+
+
+async def _refresh_profile_memory(user_id: str) -> None:
+    """Recompute the learner's weak topics and stats from their review history.
+
+    This is the write half of long-term memory: ``/chat`` reads the profile into
+    the system prompt, and every graded answer updates it, so the tutor's picture
+    of a student improves across sessions.
+
+    Derived from ``get_progress`` — which computes from card history — rather than
+    from incremented counters, so the profile cannot drift away from the reviews
+    that produced it. Failures are swallowed: the learner's answer is already
+    graded and scheduled, and losing a memory refresh must not undo that.
+    """
+    if "get_progress" not in MCP_TOOLS or "update_profile" not in MCP_TOOLS:
+        return
+    try:
+        progress = await _call_tool("get_progress", user_id=user_id)
+        await _call_tool(
+            "update_profile",
+            user_id=user_id,
+            weak_topics=progress.get("weak_topics", {}),
+            stats={
+                "total_reviews": progress.get("total_reviews", 0),
+                "accuracy": progress.get("accuracy", 0.0),
+            },
+        )
+    except Exception:
+        logger.warning("could not refresh profile memory for %s", user_id, exc_info=True)
+
+
+def _decode_b64(value: str, what: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ApiError(f"That {what} wasn't valid base64.", code="bad_encoding") from exc
+
+
+# --- request models -----------------------------------------------------------
+
+
+class DeckRequest(BaseModel):
+    user_id: str
+    title: str
+    text: str | None = None
+    file_b64: str | None = None
+    content_type: str | None = None
+
+
+class SessionStartRequest(BaseModel):
+    user_id: str
+    deck_id: str | None = None
+
+
+class AdvanceClockRequest(BaseModel):
+    """Demo only. Days to skip forward, so a schedule can be shown playing out."""
+
+    days: int = 1
+
+
+class AnswerRequest(BaseModel):
+    user_id: str
+    deck_id: str
+    card_id: str
+    card_front: str
+    card_back: str
+    student_answer: str = Field(default="")
+
+
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+
+
+class TranscribeRequest(BaseModel):
+    audio_b64: str
+
+
+# --- endpoints ----------------------------------------------------------------
+
+
+@app.get("/health")
+async def health():
+    """Liveness/readiness probe. Reports dependency state for debugging."""
+    # Demo mode is inferred from study-mcp having registered the tool rather than
+    # read from our own environment: one source of truth, so the button cannot
+    # appear against a server that would refuse it.
+    demo_mode = "advance_clock" in MCP_TOOLS
+    return {
+        "status": "ok",
+        "llm": LLM is not None,
+        "mcp_tools": len(MCP_TOOLS),
+        "voice": VOICE_CLIENT is not None,
+        "demo_mode": demo_mode,
+        "simulated_date": (await _clock_state()).get("simulated_date") if demo_mode else None,
+    }
+
+
+async def _clock_state() -> dict:
+    """study-mcp's clock, or ``{}`` if it cannot be read.
+
+    Health must stay answerable even when the demo tool misbehaves — a probe that
+    500s over a demo affordance would take the service out of rotation.
+    """
+    if "get_clock" not in MCP_TOOLS:
+        return {}
+    try:
+        return await _call_tool("get_clock")
+    except Exception:
+        logger.warning("could not read the demo clock", exc_info=True)
+        return {}
+
+
+@app.post("/decks")
+async def create_deck(request: DeckRequest):
+    """Ingest material, store the original in S3, and generate a deck of cards."""
+    if not request.text and not request.file_b64:
+        raise ApiError("Send either some text or a file to make cards from.")
+
+    source_s3_key = None
+
+    if request.file_b64:
+        data = _decode_b64(request.file_b64, "file")
+        try:
+            material = extract_text(data, request.content_type or "")
+        except IngestError as exc:
+            # The message is already written for the learner.
+            raise ApiError(str(exc), code="bad_upload") from exc
+
+        if S3_BUCKET:
+            source_s3_key = f"uploads/{request.user_id}/{uuid.uuid4()}"
+            try:
+                _s3_client().put_object(
+                    Bucket=S3_BUCKET,
+                    Key=source_s3_key,
+                    Body=data,
+                    ContentType=request.content_type or "application/octet-stream",
+                )
+            except Exception:
+                # Losing the archive copy should not cost the learner their deck.
+                logger.exception("could not archive upload to S3")
+                source_s3_key = None
+    else:
+        material = request.text
+
+    deck = await _call_tool(
+        "create_deck",
+        user_id=request.user_id,
+        title=request.title,
+        source_s3_key=source_s3_key,
+    )
+    deck_id = deck.get("deck_id")
+    metrics.decks_created.inc()
+
+    cards = generate_cards(material, LLM)
+    metrics.sync_llm_counters(LLM, _LLM_COUNTER_STATE)
+    if cards:
+        metrics.cards_generated.inc(len(cards))
+
+    for card in cards:
+        await _call_tool(
+            "add_card",
+            deck_id=deck_id,
+            user_id=request.user_id,
+            front=card["front"],
+            back=card["back"],
+            topic=card.get("topic", "general"),
+        )
+
+    response = {
+        "deck_id": deck_id,
+        "card_count": len(cards),
+        "source_s3_key": source_s3_key,
+    }
+    if not cards:
+        response["warning"] = (
+            "I couldn't make cards from that material. Try a longer or clearer "
+            "excerpt."
+        )
+    return response
+
+
+@app.post("/session/start")
+async def session_start(request: SessionStartRequest):
+    """Begin a study session: read the learner's profile and fetch what is due."""
+    profile = await _call_tool("get_profile", user_id=request.user_id)
+    due = await _call_tool("get_due_cards", user_id=request.user_id)
+    cards = due.get("cards", [])
+
+    # Due cards are interleaved across every deck the learner owns, so the study
+    # view needs to know which deck each one came from to group or label them.
+    decks = _label_decks(cards, await _deck_titles(request.user_id)) if cards else []
+
+    response = {"cards": cards, "profile": profile, "decks": decks}
+    if not cards:
+        response["message"] = "Nothing due right now — want to study ahead?"
+    return response
+
+
+@app.post("/session/answer")
+async def session_answer(request: AnswerRequest):
+    """Grade an answer and reschedule the card.
+
+    The Grader assigns a quality 0-5; ``grade_card`` in study-mcp does the SM-2
+    arithmetic. Neither this endpoint nor the LLM computes a date.
+    """
+    verdict = grade_answer(
+        request.card_front, request.card_back, request.student_answer, LLM
+    )
+    metrics.sync_llm_counters(LLM, _LLM_COUNTER_STATE)
+    metrics.quizzes_graded.inc()
+    if verdict["is_correct"]:
+        metrics.quiz_correct.inc()
+
+    schedule = await _call_tool(
+        "grade_card",
+        deck_id=request.deck_id,
+        card_id=request.card_id,
+        quality=verdict["quality"],
+    )
+
+    await _refresh_profile_memory(request.user_id)
+
+    return {
+        "is_correct": verdict["is_correct"],
+        "explanation": verdict["explanation"],
+        "quality": verdict["quality"],
+        "interval_days": schedule.get("interval_days"),
+        "due_date": schedule.get("due_date"),
+    }
+
+
+@app.post("/demo/advance-clock")
+async def demo_advance_clock(request: AdvanceClockRequest):
+    """Skip the simulated date forward so a schedule can be demonstrated.
+
+    Thin passthrough: study-mcp owns the clock and enforces the demo gate, so a
+    build with demo mode off has no ``advance_clock`` tool and this returns 404
+    rather than silently doing nothing.
+    """
+    if "advance_clock" not in MCP_TOOLS:
+        raise ApiError("Demo mode is disabled.", status_code=404, code="demo_disabled")
+    return await _call_tool("advance_clock", days=request.days)
+
+
+@app.post("/demo/reset-clock")
+async def demo_reset_clock():
+    """Return the simulated date to the real one, to re-run a demo cleanly."""
+    if "reset_clock" not in MCP_TOOLS:
+        raise ApiError("Demo mode is disabled.", status_code=404, code="demo_disabled")
+    return await _call_tool("reset_clock")
+
+
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    """Free-form tutoring turn, run through the orchestrator's ReAct loop.
+
+    Reads the learner's stored profile first and folds it into the system prompt,
+    so the tutor arrives already knowing what this student struggles with.
+    """
+    tools = {**SUB_AGENT_TOOLS, **MCP_TOOLS}
+    profile = await _load_profile(request.user_id)
+
+    messages = [
+        {"role": "system", "content": build_system_prompt(profile)},
+        {"role": "user", "content": f"[user_id: {request.user_id}] {request.message}"},
+    ]
+
+    result = await arun_agent(messages, LLM, tools)
+    metrics.record_agent_run(result)
+    metrics.sync_llm_counters(LLM, _LLM_COUNTER_STATE)
+
+    return {
+        "response": result["response"],
+        "iterations": result["iterations"],
+        "tools_called": result["tools_called"],
+        "capped": result["capped"],
+        "llm_failed": result["llm_failed"],
+    }
+
+
+@app.post("/transcribe")
+async def transcribe_audio(request: TranscribeRequest):
+    """Transcribe a spoken answer. Returns empty text rather than failing."""
+    audio = _decode_b64(request.audio_b64, "audio")
+
+    if VOICE_CLIENT is None:
+        return {
+            "text": "",
+            "message": "Voice input isn't available right now — please type your answer.",
+        }
+
+    text = transcribe(audio, VOICE_CLIENT)
+    response = {"text": text}
+    if not text:
+        metrics.transcription_failures.inc()
+        response["message"] = "I couldn't make that out — please type your answer."
+    return response
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), log_config=None
+    )

@@ -1,0 +1,8 @@
+node_modules/
+.next/
+npm-debug.log*
+.env
+.env.*
+# Dev-only harnesses: they pull in Playwright and are never run in the image.
+smoke.mjs
+voice-check.mjs

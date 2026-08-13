@@ -1,0 +1,69 @@
+# Non-secret configuration for every Recall service in the dev namespace.
+#
+# Split from the Secret on purpose (docs/plan.md:842): table names and model ids
+# are not sensitive and benefit from being reviewable in git, whereas
+# DEEPGRAM_API_KEY and the AWS keys must never be committed. All pods mount both
+# with `envFrom`, so a value's location here vs. in the Secret is invisible to the
+# application.
+#
+# THE TABLE/BUCKET/TOPIC VALUES COME FROM TERRAFORM. They embed the account id and
+# region and are not guessable — regenerate rather than retype:
+#
+#   cd infra/terraform
+#   terraform output -json | jq -r '.configmap_env.value | to_entries[] | "\(.key)=\(.value)"'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: recall-config
+  namespace: dev
+  labels:
+    app.kubernetes.io/part-of: recall
+data:
+  # --- AWS resource names (from `terraform output configmap_env`) ---
+  RECALL_CARDS_TABLE: "shahdra-recall-Cards"
+  RECALL_DECKS_TABLE: "shahdra-recall-Decks"
+  RECALL_PROFILE_TABLE: "shahdra-recall-LearnerProfile"
+  RECALL_S3_BUCKET: "shahdra-recall-us-east-1-uploads-228281126655"
+  RECALL_SNS_TOPIC_ARN: "arn:aws:sns:us-east-1:228281126655:shahdra-recall-us-east-1-reminders"
+  AWS_REGION: "us-east-1"
+
+  # --- Cluster topology ---
+  #
+  # Overrides the localhost default compiled into the code. The `/mcp` suffix is
+  # required: that is the streamable-http endpoint the MCP client connects to, and
+  # the bare Service root does not speak MCP.
+  STUDY_MCP_URL: "http://study-mcp:9000/mcp"
+
+  # --- Models ---
+  #
+  # Both are on the course account's Bedrock allowlist (the
+  # `bedrock-restrict-developers` policy carries an explicit deny for anything
+  # else) and both were verified to support tool calling — a model that cannot
+  # call tools cannot drive the ReAct loop. The pair is deliberately
+  # cross-provider so one provider's outage cannot take out both.
+  MODEL: "bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0"
+  FALLBACK_MODEL: "bedrock:amazon.nova-lite-v1:0"
+
+  # --- Behaviour ---
+  LOG_LEVEL: "INFO"
+
+  # The browser calls the tutor-agent directly at a NodePort URL derived at
+  # runtime from window.location, so the origin varies with the node's IP. "*"
+  # avoids pinning that IP here. Safe for this app: no cookies or credentials are
+  # sent, so there is nothing for a hostile origin to ride on.
+  CORS_ORIGINS: "*"
+
+  # Demo clock: lets the ⏩ control shift "today" forward so a reviewer can watch
+  # the SM-2 schedule play out without waiting days.
+  #
+  # DEV ONLY. The offset is process-wide, so in a multi-user deployment one
+  # person's ⏩ would move time for everyone. The prod ConfigMap OMITS this key
+  # entirely rather than setting it "false" — the demo routes and MCP tools are
+  # registered based on presence, and absence is the unambiguous way to be sure
+  # they never exist in prod.
+  RECALL_DEMO_MODE: "true"
+
+  # NOTE: AWS_ENDPOINT_URL_DYNAMODB is deliberately absent in both environments.
+  # boto3 applies it to EVERY service, so setting it for DynamoDB Local also
+  # redirects Bedrock, and model calls fail with an opaque InternalFailure. It
+  # belongs only in docker-compose.yml.
