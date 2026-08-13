@@ -41,7 +41,7 @@ spec:
           # Pinned by commit SHA, never `latest`. A mutable tag makes the running
           # code unknowable and breaks rollback: `kubectl rollout undo` would
           # return to the same tag now pointing at different bytes.
-          image: shahdra/recall-study-mcp:6689d49
+          image: shahdra/recall-study-mcp:f71085825950f8fdb916adfce2a1318b06737ec5
           ports:
             - name: http
               containerPort: 9000
