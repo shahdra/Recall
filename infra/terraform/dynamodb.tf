@@ -102,11 +102,23 @@ resource "aws_dynamodb_table" "cards" {
     enabled = true
   }
 
-  # A table rename destroys and recreates it, silently losing every card and all
-  # review history. Names come from variables, so a typo in tfvars is exactly how
-  # that would happen.
+  # prevent_destroy is OFF so `terraform destroy` can tear the whole stack down.
+  #
+  # What that gives up: a table rename destroys and recreates the table, and
+  # DynamoDB cannot rename in place — the replacement is empty and every card and
+  # all review history is gone. Names are built from `owner` and
+  # `table_name_prefix`, so a typo in tfvars produces exactly that plan. With the
+  # guard on, such a plan failed; now it succeeds silently.
+  #
+  # This value cannot be driven by a variable — Terraform rejects any expression in
+  # `lifecycle` ("Variables may not be used here"), so a `-var allow_destroy=true`
+  # switch is not possible. The guard is on or off in committed code.
+  #
+  # Mitigation, since the plan no longer stops you: read the plan before applying.
+  # `replace` or `destroy` on any of these three tables means data loss, and
+  # point_in_time_recovery defaults to false, so there is no backup to restore.
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 
   tags = {
@@ -140,8 +152,10 @@ resource "aws_dynamodb_table" "decks" {
     enabled = true
   }
 
+  # Off so the stack is destroyable; see the note on aws_dynamodb_table.cards for
+  # what that gives up and why a variable cannot gate it.
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 
   tags = {
@@ -173,8 +187,10 @@ resource "aws_dynamodb_table" "learner_profile" {
     enabled = true
   }
 
+  # Off so the stack is destroyable; see the note on aws_dynamodb_table.cards for
+  # what that gives up and why a variable cannot gate it.
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 
   tags = {

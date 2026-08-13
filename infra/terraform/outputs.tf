@@ -68,3 +68,80 @@ output "cards_due_index_arn" {
   EOT
   value       = "${aws_dynamodb_table.cards.arn}/index/due-index"
 }
+
+# ===========================================================================
+# Cluster
+# ===========================================================================
+#
+# Re-exported from module.k8s_cluster. The runbook's commands read these, so the
+# names here are what RUNBOOK.md quotes.
+
+output "vpc_id" {
+  description = "The cluster VPC."
+  value       = module.vpc.vpc_id
+}
+
+output "public_subnet_ids" {
+  description = "Public subnets the nodes run in (one per AZ)."
+  value       = module.vpc.public_subnets
+}
+
+output "control_plane_public_ip" {
+  description = "Public IP of the control plane. SSH here to run infra/k8s/bootstrap.sh."
+  value       = module.k8s_cluster.control_plane_public_ip
+}
+
+output "control_plane_instance_id" {
+  description = "Control-plane instance id, for `aws ec2` / `aws ssm start-session`."
+  value       = module.k8s_cluster.control_plane_instance_id
+}
+
+output "worker_asg_name" {
+  description = "Worker Auto Scaling Group name."
+  value       = module.k8s_cluster.worker_asg_name
+}
+
+output "join_command_ssm_parameter" {
+  description = <<-EOT
+    SSM parameter carrying the `kubeadm join` command. Created by the control plane at
+    boot, NOT by Terraform — so `terraform destroy` leaves it behind and the runbook
+    deletes it by hand.
+  EOT
+  value       = module.k8s_cluster.join_command_ssm_parameter
+}
+
+# --- Paste-ready commands ---------------------------------------------------
+#
+# These exist because the control plane's IP is not known until apply finishes, so
+# every one of these commands has to be assembled from an output anyway. Emitting
+# them fully-formed removes the step where you paste the wrong IP.
+
+output "ssh_command" {
+  description = "SSH to the control plane."
+  value       = "ssh -i ${var.ssh_private_key_path} ubuntu@${module.k8s_cluster.control_plane_public_ip}"
+}
+
+output "fetch_kubeconfig_command" {
+  description = <<-EOT
+    Copy the control plane's public-IP kubeconfig to your laptop. Run AFTER
+    bootstrap.sh. Note it writes ~/.kube/config-recall rather than ~/.kube/config so
+    it cannot clobber an existing context; use it with
+    `export KUBECONFIG=~/.kube/config-recall`.
+  EOT
+  value       = "scp -i ${var.ssh_private_key_path} ubuntu@${module.k8s_cluster.control_plane_public_ip}:${module.k8s_cluster.kubeconfig_path_on_control_plane} ~/.kube/config-recall"
+}
+
+output "recall_urls" {
+  description = <<-EOT
+    Where the app is reachable once the manifests are synced. These point at the
+    CONTROL PLANE's IP, which works because kube-proxy makes every NodePort answer on
+    every node — convenient here since worker IPs change whenever the ASG replaces an
+    instance, while the control plane's does not.
+  EOT
+  value = {
+    dev_frontend     = "http://${module.k8s_cluster.control_plane_public_ip}:30300"
+    dev_tutor_agent  = "http://${module.k8s_cluster.control_plane_public_ip}:30800"
+    prod_frontend    = "http://${module.k8s_cluster.control_plane_public_ip}:31300"
+    prod_tutor_agent = "http://${module.k8s_cluster.control_plane_public_ip}:31800"
+  }
+}

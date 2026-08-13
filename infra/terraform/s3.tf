@@ -8,7 +8,7 @@
 #
 # The write is best-effort by design: app.py:499 catches every exception and drops
 # the archive rather than failing the upload, so an outage here costs a learner
-# nothing. That is also why there is no `force_destroy` — see below.
+# nothing — which is part of why this bucket is safe to make destroyable.
 
 resource "aws_s3_bucket" "uploads" {
   # Bucket names are globally unique across ALL AWS accounts, so the account id is
@@ -16,11 +16,23 @@ resource "aws_s3_bucket" "uploads" {
   # be taken by a stranger and the apply would fail with a confusing 409.
   bucket = "${local.name_prefix}-uploads-${data.aws_caller_identity.current.account_id}"
 
-  # No force_destroy. With it, `terraform destroy` empties the bucket first and the
-  # uploads are gone; without it, destroy fails on a non-empty bucket and forces a
-  # deliberate `aws s3 rm --recursive` before anything can be deleted.
+  # force_destroy lets `terraform destroy` empty the bucket and delete it. Both
+  # halves are needed: versioning is enabled below, so even after deleting every
+  # object the bucket still holds old versions and delete markers, and a
+  # BucketNotEmpty error would fail the destroy at the very last step.
+  #
+  # Unlike prevent_destroy this is an ordinary argument, so it CAN be variable-
+  # driven if the guard is ever wanted back — `var.uploads_force_destroy` or
+  # similar. It is a literal here to match the prevent_destroy lines, which cannot
+  # be.
+  force_destroy = true
+
+  # Off so the stack is destroyable. Note this bucket is the least dangerous of the
+  # four: the objects are archived source material that nothing reads back
+  # (app.py never GETs them), so losing them costs re-uploading a file, not review
+  # history. The DynamoDB tables are where the irreplaceable data is.
   lifecycle {
-    prevent_destroy = true
+    prevent_destroy = false
   }
 
   tags = {

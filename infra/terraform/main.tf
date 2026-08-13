@@ -1,21 +1,37 @@
 # Recall — AWS resources as code.
 #
-# Scope is deliberately narrow: the three DynamoDB tables, the uploads bucket, the
-# reminder SNS topic, and an IAM user for the pods. It does NOT provision a
-# Kubernetes cluster — Recall deploys into `dev` and `prod` namespaces on the
-# existing cluster, so standing up a second one would duplicate ~26 resources in a
-# shared account for no benefit.
+# Two layers in one root module:
 #
-# The WORKSPACE identifies the REGION, not the environment (a convention carried
-# over from the cluster's own Terraform). Both dev and prod read the same tables:
-# separating them would mean six tables and a second bucket, which the course
-# project does not need. Environment separation is at the Kubernetes layer.
+#   1. Data plane — three DynamoDB tables, the uploads bucket, the reminder SNS
+#      topic, and a least-privilege IAM user whose keys the pods use.
+#   2. Compute — a VPC and a kubeadm Kubernetes cluster on EC2 (one control plane
+#      plus a worker ASG) for the pods to run on.
+#
+# They are one module rather than two because the cluster is useless without the
+# tables and vice versa, and a single `apply` that produces a working system is
+# worth more here than the blast-radius isolation two states would buy.
+#
+# ── Terraform is NOT the whole story ───────────────────────────────────────
+# `terraform apply` leaves you with nodes that report NotReady forever, because
+# nothing has installed a CNI. infra/k8s/bootstrap.sh is the second half: Calico,
+# the EBS CSI driver, namespaces, the recall-secrets Secret, ArgoCD, and the ArgoCD
+# Applications. Run it over SSH after apply — see RUNBOOK.md.
+#
+# ── The workspace is the REGION ────────────────────────────────────────────
+# Not the environment. Both dev and prod are Kubernetes namespaces on ONE cluster
+# reading ONE set of tables; separating them at the AWS layer would mean six tables,
+# two buckets, and two clusters for a course project that needs none of it.
 #
 #   terraform workspace select us-east-1
-#   terraform plan -var-file=tfvars/us-east-1.tfvars
+#   terraform apply -var-file=tfvars/us-east-1.tfvars
 #
-# NOTE: `terraform apply` requires instructor approval before it is run — the
-# account is shared with the course (docs/plan.md:827). validate + plan only.
+# ── Cost and the budget keeper ─────────────────────────────────────────────
+# The data plane is nearly free at rest. The cluster is not: two t3.medium
+# instances bill by the hour. A course Lambda (aws-learning-budget-keeper-function)
+# also STOPS every EC2 instance in this account at 16:00 and 00:00 daily, and a
+# stopped control plane cannot be restarted — kubeadm baked its public IP into the
+# API server certificate, so a new IP fails TLS verification. Expect to destroy and
+# re-apply rather than stop and start. RUNBOOK.md has both procedures.
 
 terraform {
   required_version = ">= 1.7.0"
@@ -86,4 +102,75 @@ resource "terraform_data" "workspace_region_guard" {
       error_message = "Workspace '${terraform.workspace}' does not match region '${var.region}'. Run: terraform workspace select ${var.region}"
     }
   }
+}
+
+# --- Networking -------------------------------------------------------------
+#
+# AZs actually available in whatever region the provider points at — never
+# hard-coded, so the config is portable across regions.
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+# The community VPC module builds subnets, route tables, and the internet gateway
+# from one block. Using it rather than hand-rolling ~10 resources is the same call
+# the reference project made, and it is a well-audited module.
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.8.1"
+
+  name = "${local.name_prefix}-vpc"
+  cidr = var.vpc_cidr
+
+  # slice(...,0,2) takes the first two AZs, giving two public subnets in different
+  # Availability Zones without naming any region-specific AZ.
+  azs = slice(data.aws_availability_zones.available.names, 0, 2)
+
+  # cidrsubnet() derives the ranges from var.vpc_cidr, so changing the VPC CIDR does
+  # not require editing subnet literals.
+  # 10.0.0.0/16 -> 10.0.101.0/24, 10.0.102.0/24
+  public_subnets = [
+    cidrsubnet(var.vpc_cidr, 8, 101),
+    cidrsubnet(var.vpc_cidr, 8, 102),
+  ]
+
+  # No private subnets, which also means no NAT gateway. A NAT would add ~$32/month
+  # for no benefit here: every node needs outbound internet (apt, image pulls,
+  # Bedrock) and inbound NodePort access, so they belong in public subnets.
+  private_subnets    = []
+  enable_nat_gateway = false
+
+  # Workers launched by the ASG need public IPs to be reachable on NodePorts and to
+  # pull images.
+  map_public_ip_on_launch = true
+
+  # kubelet registers nodes by their private DNS name
+  # (ip-10-0-x-y.<region>.compute.internal); both of these must be on for that to
+  # resolve.
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+}
+
+# --- The cluster ------------------------------------------------------------
+module "k8s_cluster" {
+  source = "./modules/k8s-cluster"
+
+  cluster_name = local.name_prefix
+  region       = var.region
+  owner        = var.owner
+
+  vpc_id     = module.vpc.vpc_id
+  vpc_cidr   = var.vpc_cidr
+  subnet_ids = module.vpc.public_subnets
+
+  control_plane_instance_type = var.control_plane_instance_type
+  worker_instance_type        = var.worker_instance_type
+  worker_desired_capacity     = var.worker_desired_capacity
+  root_volume_size            = var.root_volume_size
+
+  kubernetes_version = var.kubernetes_version
+  pod_network_cidr   = var.pod_network_cidr
+
+  ssh_key_name     = var.ssh_key_name
+  ssh_ingress_cidr = var.ssh_ingress_cidr
 }
