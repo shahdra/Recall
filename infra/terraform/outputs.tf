@@ -76,6 +76,15 @@ output "cards_due_index_arn" {
 # Re-exported from module.k8s_cluster. The runbook's commands read these, so the
 # names here are what RUNBOOK.md quotes.
 
+output "cluster_name" {
+  description = <<-EOT
+    Cluster identity — prefixes every resource name and the SSM parameter path. Read
+    by the Provision Cluster workflow for its run summary, which is the only way to
+    tell two regions' clusters apart at a glance.
+  EOT
+  value       = local.name_prefix
+}
+
 output "vpc_id" {
   description = "The cluster VPC."
   value       = module.vpc.vpc_id

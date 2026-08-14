@@ -216,11 +216,16 @@ chmod 0644 /etc/cron.d/kubeadm-token-refresh
 # ---------------------------------------------------------------------------
 # 8. Ready sentinel
 # ---------------------------------------------------------------------------
-# bootstrap.sh polls for this file. Polling a sentinel rather than just port 22
-# matters because SSH opens long before the API server is up.
-touch /var/lib/cloud/control-plane-ready
-
 echo "=== control-plane bootstrap COMPLETE ==="
 echo "Nodes will report NotReady until a CNI is installed - that is EXPECTED."
 echo "Run infra/k8s/bootstrap.sh next; it installs Calico and everything else."
 kubectl get nodes || true
+
+# The .github/workflows/cluster.yaml bootstrap job polls for this file, so it MUST be
+# the very last statement in this script. Polling a sentinel rather than port 22 is
+# the point: SSH opens minutes before the API server does, so anything keyed on "can
+# I connect yet" starts bootstrapping against a control plane that is not up.
+#
+# Anything added below this line is a race — the poller sees the file and proceeds
+# while those commands are still running.
+touch /var/lib/cloud/control-plane-ready
