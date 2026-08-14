@@ -36,13 +36,14 @@ output "reminders_topic_arn" {
   value       = aws_sns_topic.reminders.arn
 }
 
-output "app_iam_user" {
+output "app_iam_role" {
   description = <<-EOT
-    IAM user whose access keys the pods use. Create the key pair with:
-      aws iam create-access-key --user-name <this value>
-    Keys are deliberately not managed by Terraform — see iam.tf.
+    IAM role the pods' AWS access comes from. There is no IAM user and no access key
+    to mint: pods inherit this role from the worker instance via the metadata service
+    (see iam.tf). Inspect what they may do with:
+      aws iam get-role-policy --role-name <this value> --policy-name <this value>-app
   EOT
-  value       = aws_iam_user.app.name
+  value       = module.k8s_cluster.worker_iam_role_name
 }
 
 # Convenience shape for copying into the ConfigMap in one step, rather than
@@ -75,6 +76,15 @@ output "cards_due_index_arn" {
 #
 # Re-exported from module.k8s_cluster. The runbook's commands read these, so the
 # names here are what RUNBOOK.md quotes.
+
+output "cluster_name" {
+  description = <<-EOT
+    Cluster identity — prefixes every resource name and the SSM parameter path. Read
+    by the Provision Cluster workflow for its run summary, which is the only way to
+    tell two regions' clusters apart at a glance.
+  EOT
+  value       = local.name_prefix
+}
 
 output "vpc_id" {
   description = "The cluster VPC."

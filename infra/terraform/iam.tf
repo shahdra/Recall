@@ -1,35 +1,37 @@
-# Credentials for the pods.
+# The application's AWS permissions.
 #
-# WHY AN IAM USER AND NOT A ROLE: the cluster Recall deploys onto is kubeadm on
-# EC2, with no OIDC provider, so there is no IRSA and a pod cannot assume a role by
-# service account. The worker node's instance role grants only SSM and ECR — no
-# DynamoDB, S3, SNS or Bedrock — so inheriting the node role gives the pods nothing.
-# That leaves static access keys delivered through a Kubernetes Secret, which is
-# what the reference project on the same cluster does.
+# This file defines WHAT the pods may do. WHERE it is attached is
+# modules/k8s-cluster/main.tf, which binds this document inline to the worker node
+# role; pods inherit it through the instance metadata service, and boto3's default
+# credential chain finds it with no configuration. Nothing in services/ reads
+# AWS_ACCESS_KEY_ID, so this needed no application change.
 #
-# The keys are NOT created here. `aws_iam_access_key` writes the secret access key
-# into Terraform state in plaintext, and this state lives in an S3 bucket in an
-# account shared with the course. RUNBOOK.md documents creating the key pair with
-# the CLI and loading it straight into the Secret.
+# WHY A NODE ROLE AND NOT AN IAM USER WITH STATIC KEYS.
+# The earlier design here was a dedicated `-app` IAM user whose access keys were
+# minted with the CLI and loaded into the `recall-secrets` Kubernetes Secret. That is
+# what the reference project on the same cluster does, and it has one genuine
+# advantage: permissions scope per-workload rather than per-node.
+#
+# It was replaced because it created a credential treadmill. `terraform destroy`
+# deletes the user, so its keys die with every teardown — and this project's whole
+# cost strategy is destroy-and-reapply, because the course budget keeper stops EC2
+# twice daily and a stopped kubeadm control plane cannot be restarted. Every cycle
+# would mean minting a new key pair and re-pasting it into a GitHub secret and a local
+# env file. Credentials that must be re-copied on every apply get copied wrong, and a
+# stale key fails at runtime looking like an application bug.
+#
+# The node role has none of that: nothing to mint, nothing to store, nothing to
+# rotate, and AWS hands out short-lived credentials instead of permanent ones.
+#
+# WHAT IT GIVES UP: every pod on a worker gets these permissions, not only Recall's
+# four. Pod-level scoping is IRSA's job, and IRSA requires an OIDC provider that a
+# kubeadm cluster does not have. On a single-tenant lab cluster destroyed nightly the
+# distinction costs nothing; on a shared production cluster it would not be
+# acceptable.
 #
 # EVERY STATEMENT IS SCOPED TO A NAMED ARN. Never "Resource": "*" — the account is
-# shared, so a wildcard would hand Recall's pods read/write access to a
-# classmate's tables.
-
-resource "aws_iam_user" "app" {
-  name = "${local.name_prefix}-app"
-  path = "/recall/"
-
-  tags = {
-    Name = "${local.name_prefix}-app"
-  }
-}
-
-resource "aws_iam_user_policy" "app" {
-  name   = "${local.name_prefix}-app"
-  user   = aws_iam_user.app.name
-  policy = data.aws_iam_policy_document.app.json
-}
+# shared, so a wildcard would hand Recall's pods read/write access to a classmate's
+# tables.
 
 data "aws_iam_policy_document" "app" {
   # --- DynamoDB -------------------------------------------------------------

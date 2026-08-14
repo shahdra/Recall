@@ -16,3 +16,4 @@ USER recall
 # No EXPOSE and no PORT: this is a batch job, not a server. It runs once, publishes
 # at most one SNS message, and exits — the CronJob schedules it.
 CMD ["python", "reminder.py"]
+

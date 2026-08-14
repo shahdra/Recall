@@ -1,0 +1,283 @@
+# CD — build changed service images, push them to Docker Hub, and bump their tags
+# in the Kubernetes manifests.
+#
+# GitOps: this workflow never touches the cluster. It builds an image, writes the
+# new tag into a manifest, and commits that. ArgoCD notices the commit and syncs.
+# Nothing here needs kubeconfig or cluster credentials.
+#
+# The two branches behave DIFFERENTLY, and the asymmetry is the design:
+#
+#   push to dev   -> bump infra/k8s/dev/<svc>/   -> commit pushed DIRECTLY to dev
+#                    (the recall-dev ArgoCD Application auto-syncs, so the change is
+#                    live within a minute)
+#
+#   push to main  -> bump infra/k8s/prod/<svc>/  -> commit pushed to a SIDE BRANCH,
+#                    then a PR is opened against main
+#
+# WHY main GETS A PR AND NOT A DIRECT PUSH:
+# `main` is currently UNPROTECTED, so CI *could* push to it. This opens a PR anyway,
+# for two reasons. First, it gives prod two independent gates — merging the PR, and
+# then the recall-prod ArgoCD Application being manual-sync — so nothing reaches prod
+# without two deliberate human actions. Second, it keeps working unchanged the day
+# branch protection is switched on; a direct push would start failing that day, and
+# the failure would look like a CI bug rather than a policy change.
+#
+# WHY main IS A TRIGGER AT ALL, given promotion-by-merge already carries the dev tag:
+# it closes a real hole. A hotfix PR'd straight to main, bypassing dev, would
+# otherwise get no image build, leaving the prod manifest pointing at a tag that was
+# never pushed to Docker Hub -> ImagePullBackOff.
+#
+# REQUIRED REPOSITORY SECRETS:
+#   DOCKERHUB_USERNAME  Docker Hub account that owns the shahdra/recall-* repos
+#   DOCKERHUB_TOKEN     Docker Hub ACCESS TOKEN (Account Settings -> Personal access
+#                       tokens), not the account password. Needs Read/Write.
+name: CD
+
+on:
+  push:
+    branches: [dev, main]
+    paths:
+      - "services/**"
+      - ".github/workflows/cd.yaml"
+  # Manual rebuild without a code change (Actions tab -> Run workflow). This is how
+  # you get the first set of images built, since the manifests currently reference a
+  # tag that was never pushed.
+  workflow_dispatch:
+    inputs:
+      all_services:
+        description: "Build every service, ignoring the changed-paths filter"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # push the bump to dev, or push the PR side-branch for main
+  pull-requests: write # `gh pr create` for the main -> prod promotion PR
+
+# Don't let two pushes to the same branch race each other's manifest commits.
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Which services actually changed? Avoids rebuilding all four on every push —
+  # the frontend alone is a multi-stage Next.js build.
+  changes:
+    runs-on: ubuntu-latest
+    # Skip runs triggered by our own bump commits. Belt and braces: the bump only
+    # edits infra/k8s/** so the paths filter above already excludes it, and the commit
+    # message carries [skip ci].
+    if: github.actor != 'github-actions[bot]'
+    outputs:
+      services: ${{ steps.select.outputs.services }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # Output is a JSON array of the keys that matched, e.g. ["frontend"], which
+          # feeds the build matrix below.
+          filters: |
+            study-mcp:
+              - 'services/study-mcp/**'
+            tutor-agent:
+              - 'services/tutor-agent/**'
+            frontend:
+              - 'services/frontend/**'
+            reminder:
+              - 'services/reminder/**'
+
+      # A manual dispatch has no meaningful "changed paths" — the previous commit may
+      # be unrelated — so it builds everything by default. This is also the path that
+      # produces the very first images.
+      - name: Select services to build
+        id: select
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+             && [ "${{ inputs.all_services }}" = "true" ]; then
+            echo 'services=["study-mcp","tutor-agent","frontend","reminder"]' >> "$GITHUB_OUTPUT"
+            echo "manual dispatch: building all four services"
+          else
+            echo 'services=${{ steps.filter.outputs.changes }}' >> "$GITHUB_OUTPUT"
+            echo "changed: ${{ steps.filter.outputs.changes }}"
+          fi
+
+  build-and-bump:
+    needs: changes
+    # An empty matrix is a workflow error, so skip the job entirely when nothing
+    # relevant changed (e.g. a README-only push under services/).
+    if: needs.changes.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      # One service failing to build must not cancel the others.
+      fail-fast: false
+      # Serialise: every leg commits a manifest bump to the SAME branch. Running one
+      # at a time removes the push race rather than relying on retries to survive it.
+      max-parallel: 1
+      matrix:
+        service: ${{ fromJSON(needs.changes.outputs.services) }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          # Full history so `git pull --rebase` has something to rebase onto.
+          fetch-depth: 0
+
+      # Branch -> environment mapping, and the manifest FILENAME.
+      #
+      # The filename cannot be derived as <svc>/<svc>.yaml: reminder is a CronJob and
+      # its file is cronjob.yaml. Hard-coding the exception here rather than renaming
+      # the file keeps the manifest name describing what the object IS.
+      - name: Resolve target environment and manifest path
+        id: target
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            ENV_DIR=prod
+          else
+            ENV_DIR=dev
+          fi
+
+          case "${{ matrix.service }}" in
+            reminder) FILE=cronjob.yaml ;;
+            *)        FILE="${{ matrix.service }}.yaml" ;;
+          esac
+
+          echo "env_dir=$ENV_DIR" >> "$GITHUB_OUTPUT"
+          echo "manifest=infra/k8s/$ENV_DIR/${{ matrix.service }}/$FILE" >> "$GITHUB_OUTPUT"
+
+      # Required for the GitHub Actions cache below. The runner's default buildx
+      # driver is `docker`, which cannot export a cache — builds fail with
+      # "Cache export is not supported for the docker driver". This sets up the
+      # docker-container driver, which can.
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: services/${{ matrix.service }}
+          push: true
+          # Full commit SHA, never "latest": every build gets a unique traceable tag,
+          # and a rollback is just pointing the manifest at an older SHA. The
+          # manifests currently carry a short 7-char tag that was written by hand;
+          # once this workflow runs, tags are 40-char SHAs from here on.
+          #
+          # No build args: the frontend deliberately resolves the agent URL at
+          # RUNTIME (services/frontend/lib/api.ts derives it as frontendPort+500), so
+          # one image serves both dev and prod. A NEXT_PUBLIC_* build arg would inline
+          # the value at build time and need two different images.
+          tags: shahdra/recall-${{ matrix.service }}:${{ github.sha }}
+          # Layer cache across runs. Worth most for the frontend (npm ci + next build)
+          # and tutor-agent (boto3/strands wheels).
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Bump the image tag in the ${{ steps.target.outputs.env_dir }} manifest
+        run: |
+          MANIFEST="${{ steps.target.outputs.manifest }}"
+          IMAGE="shahdra/recall-${{ matrix.service }}"
+
+          test -f "$MANIFEST" || { echo "::error::$MANIFEST not found"; exit 1; }
+
+          sed -i "s|image: $IMAGE:.*|image: $IMAGE:${{ github.sha }}|" "$MANIFEST"
+
+          # Fail loudly if sed matched nothing. A silent no-op here means ArgoCD keeps
+          # deploying the old image and nobody notices for days — which is exactly the
+          # failure mode that leaves a manifest pointing at an unpushed tag.
+          grep -q "image: $IMAGE:${{ github.sha }}" "$MANIFEST" \
+            || { echo "::error::sed did not update the image tag in $MANIFEST"; exit 1; }
+
+          echo "$MANIFEST -> $IMAGE:${{ github.sha }}"
+
+      # ---- dev: push straight to the branch (auto-synced by ArgoCD) ------------
+      - name: Push the bump to dev
+        if: github.ref_name == 'dev'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ steps.target.outputs.manifest }}"
+          git diff --cached --quiet && { echo "manifest already at this tag"; exit 0; }
+
+          # [skip ci] so this bump commit does not retrigger this workflow.
+          git commit -m "ci: bump ${{ matrix.service }} image to ${{ github.sha }} [skip ci]"
+
+          # max-parallel:1 serialises the matrix, but a concurrent human push to dev
+          # can still land first — hence the rebase-retry.
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase origin dev
+            if git push origin HEAD:dev; then
+              echo "pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "push attempt $attempt failed - retrying"
+            sleep $(( (RANDOM % 5) + 1 ))
+          done
+          echo "::error::push to dev failed after 5 attempts"
+          exit 1
+
+      # ---- main: PR only, never a direct push ---------------------------------
+      - name: Open a promotion PR against main
+        if: github.ref_name == 'main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MANIFEST="${{ steps.target.outputs.manifest }}"
+          BRANCH="ci/bump-prod-${{ matrix.service }}-${{ github.sha }}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$MANIFEST"
+          git diff --cached --quiet && { echo "prod manifest already at this tag"; exit 0; }
+
+          git commit -m "ci: bump ${{ matrix.service }} prod image to ${{ github.sha }} [skip ci]"
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "ci: promote ${{ matrix.service }} to ${{ github.sha }}" \
+            --body "Automated prod image bump for \`${{ matrix.service }}\`.
+
+          Image \`shahdra/recall-${{ matrix.service }}:${{ github.sha }}\` is built and pushed to Docker Hub.
+
+          After merging, the \`recall-prod\` ArgoCD Application goes \`OutOfSync\`
+          (it is manual-sync by design). Deploy it with:
+
+          \`\`\`
+          argocd app sync recall-prod
+          \`\`\`"
+
+  # Summary so a glance at the run tells you what to do next, rather than needing to
+  # open each matrix leg.
+  summary:
+    needs: [changes, build-and-bump]
+    if: always() && needs.changes.outputs.services != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "### CD — ${{ github.ref_name }}"
+            echo
+            echo "Services: \`${{ needs.changes.outputs.services }}\`"
+            echo "Tag: \`${{ github.sha }}\`"
+            echo
+            if [ "${{ needs.build-and-bump.result }}" = "success" ]; then
+              if [ "${{ github.ref_name }}" = "dev" ]; then
+                echo "✅ Images pushed and dev manifests bumped. recall-dev auto-syncs within a minute."
+              else
+                echo "✅ Images pushed. A promotion PR is open — merge it, then \`argocd app sync recall-prod\`."
+              fi
+            else
+              echo "❌ Build result: \`${{ needs.build-and-bump.result }}\` — see the job logs."
+              echo
+              echo "If this is an auth failure, check the \`DOCKERHUB_USERNAME\` and"
+              echo "\`DOCKERHUB_TOKEN\` repository secrets. The token must be a Docker Hub"
+              echo "access token with Read/Write, not the account password."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

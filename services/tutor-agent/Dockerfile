@@ -20,3 +20,4 @@ EXPOSE 8000
 # builds the model, discovers MCP tools, and sets up the voice client. Invoking
 # uvicorn directly would work too, but this keeps one startup path.
 CMD ["python", "app.py"]
+
