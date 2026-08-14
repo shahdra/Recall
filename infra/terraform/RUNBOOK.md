@@ -4,8 +4,8 @@ How to build Recall's AWS infrastructure, what it costs, and how to tear it down
 
 Two layers, one `terraform apply`:
 
-1. **Data plane** — three DynamoDB tables, the uploads bucket, the reminder SNS
-   topic, and a least-privilege IAM user whose keys the pods use. Nearly free at rest.
+1. **Data plane** — three DynamoDB tables, the uploads bucket, and the reminder SNS
+   topic. Nearly free at rest.
 2. **Compute** — a VPC and a kubeadm Kubernetes cluster on EC2 (one control plane +
    a worker Auto Scaling Group). **This is what costs money.**
 
@@ -24,14 +24,14 @@ Two layers, one `terraform apply`:
 
 ## 0. What gets created
 
-**`Plan: 50 to add, 0 to change, 0 to destroy.`** — verified with
+**`Plan: 49 to add, 0 to change, 0 to destroy.`** — verified with
 `terraform plan` against the live AWS API on 2026-08-13, provider `hashicorp/aws`
 v6.59.0.
 
 Everything carries `Owner=shahdra`, `Project=recall`, `ManagedBy=terraform`,
 `TFWorkspace=us-east-1` via the provider's `default_tags`.
 
-### Data plane — 13 resources
+### Data plane — 11 resources
 
 | # | Resource | Name |
 |---|---|---|
@@ -39,8 +39,7 @@ Everything carries `Owner=shahdra`, `Project=recall`, `ManagedBy=terraform`,
 | 1 | S3 bucket | `shahdra-recall-us-east-1-uploads-228281126655` |
 | 4 | S3 config | public-access-block, SSE-S3, versioning, lifecycle (expire uploads after 90d) |
 | 1 | SNS topic | `shahdra-recall-us-east-1-reminders` |
-| 1 | SNS topic policy | restricts publish to the app user |
-| 2 | IAM | user `shahdra-recall-us-east-1-app` + its inline policy |
+| 1 | SNS topic policy | restricts publish to this account |
 | 1 | Guard | `terraform_data.workspace_region_guard` — no AWS resource, just a precondition |
 
 Table names carry no region; the bucket and topic do. Tables are already
@@ -63,7 +62,7 @@ disambiguator available.
 every node needs outbound internet (apt, image pulls, Bedrock) *and* inbound NodePort
 access, so they belong in public subnets.
 
-### Cluster — 26 resources
+### Cluster — 27 resources
 
 | # | Resource | Detail |
 |---|---|---|
@@ -75,7 +74,7 @@ access, so they belong in public subnets.
 | 2 | Egress rules | all outbound, both SGs |
 | 2 | IAM roles | control plane, worker |
 | 6 | Role policy attachments | EBS CSI + ECR + SSM Core on each role |
-| 2 | Inline role policies | SSM `PutParameter` (control plane) / `GetParameter` (worker), scoped to one parameter path |
+| 3 | Inline role policies | SSM `PutParameter` (control plane) / `GetParameter` (worker), plus the **app policy** on the worker role — DynamoDB, S3, SNS, Bedrock, all named ARNs ([§4](#4-the-app-env-file--no-aws-keys-needed)) |
 | 2 | Instance profiles | one per role |
 
 The **AMI is looked up, not hard-coded** — newest Ubuntu 22.04 LTS from Canonical in
@@ -106,7 +105,6 @@ destroy time:
 | Thing | Created by | Destroyed by Terraform? |
 |---|---|---|
 | SSM parameter `/recall/shahdra-recall-us-east-1/join-command` | control-plane user-data | **No** — delete by hand ([§7](#7-destroy)) |
-| IAM access keys for the app user | you, with the CLI ([§4](#4-one-time-app-access-keys)) | No — deleted with the user |
 | `recall-secrets` Kubernetes Secret | `bootstrap.sh` | N/A (dies with the cluster) |
 | Any EBS volume from a PVC | EBS CSI controller | **No** — orphaned, keeps billing ([§7](#7-destroy)) |
 | Calico / ArgoCD / app workloads | `bootstrap.sh` + ArgoCD | N/A (dies with the cluster) |
@@ -204,9 +202,9 @@ cp tfvars/us-east-1.tfvars.example tfvars/us-east-1.tfvars
 terraform plan -var-file=tfvars/us-east-1.tfvars
 ```
 
-Expected: **`Plan: 50 to add, 0 to change, 0 to destroy.`**
+Expected: **`Plan: 49 to add, 0 to change, 0 to destroy.`**
 
-**The `0 to change, 0 to destroy` half matters more than the 50.** In a shared
+**The `0 to change, 0 to destroy` half matters more than the 49.** In a shared
 account, any line that is not `will be created` means this config is about to touch
 something that is not Recall's — stop and read it before going further.
 
@@ -243,33 +241,49 @@ terraform output recall_urls               # where the app will be
 
 ---
 
-## 4. One-time: app access keys
+## 4. The app env file — no AWS keys needed
 
-Terraform creates the IAM user but **not** its access keys, deliberately:
-`aws_iam_access_key` writes the secret key into state in plaintext, and that state
-lives in a bucket in a shared account.
+**There are no access keys to mint.** Pods inherit the worker node's IAM role through
+the instance metadata service; boto3's default credential chain finds it with no
+configuration, and nothing in `services/` reads `AWS_ACCESS_KEY_ID`. The policy is in
+`iam.tf`, attached to the node role in `modules/k8s-cluster/main.tf`.
 
-```bash
-aws iam create-access-key --user-name shahdra-recall-us-east-1-app
-```
-
-Put the pair into the env file that becomes the Kubernetes Secret — never into a file
-in the repo:
+So the env file that becomes the Kubernetes Secret is one line:
 
 ```bash
-cat > /tmp/recall.env <<EOF
-AWS_ACCESS_KEY_ID=AKIA...
-AWS_SECRET_ACCESS_KEY=...
-DEEPGRAM_API_KEY=$(grep '^DEEPGRAM_API_KEY=' ../../services/tutor-agent/.env | cut -d= -f2-)
-EOF
+cd /Users/saed/shahd/Recall
+grep '^DEEPGRAM_API_KEY=' services/tutor-agent/.env > /tmp/recall.env
 ```
 
-Static keys rather than a role because this is kubeadm on EC2 with **no OIDC
-provider** — there is no IRSA, and the worker instance role grants only SSM and ECR.
+Check what the pods are permitted to do:
 
-To rotate: create the second key, update the Secret, `kubectl rollout restart`,
-confirm healthy, then delete the old key. IAM allows two keys per user precisely so
-rotation needs no downtime.
+```bash
+ROLE=$(terraform output -raw app_iam_role)
+aws iam get-role-policy --role-name "$ROLE" --policy-name "$ROLE-app"
+```
+
+### Why a node role rather than an IAM user with static keys
+
+The earlier design created a dedicated `-app` IAM user, minted its keys with the CLI,
+and loaded them into `recall-secrets`. That scopes access per-workload instead of
+per-node, which is genuinely better — but `terraform destroy` deletes the user, so the
+keys died on every teardown. Given this project's cost strategy *is*
+destroy-and-reapply (§1), that meant re-minting and re-pasting credentials every
+cycle, into a GitHub secret and a local env file. Credentials that must be re-copied on
+every apply get copied wrong, and a stale key fails at runtime looking like an
+application bug.
+
+The node role has nothing to mint, store, or rotate, and AWS issues short-lived
+credentials rather than permanent ones.
+
+**What it gives up:** every pod on a worker gets these permissions, not just Recall's
+four. Pod-level scoping is IRSA's job, and IRSA needs an OIDC provider that a kubeadm
+cluster does not have. On a single-tenant cluster destroyed nightly that costs nothing.
+
+> **Do not put `AWS_ACCESS_KEY_ID` in the env file.** boto3 *prefers* an explicit
+> environment variable over the instance role, so a stale key silently shadows a
+> working node role and the pods fail with `InvalidClientTokenId` — with the role
+> sitting right there. `bootstrap.sh` warns if it finds one.
 
 ---
 

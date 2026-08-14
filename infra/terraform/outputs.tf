@@ -36,13 +36,14 @@ output "reminders_topic_arn" {
   value       = aws_sns_topic.reminders.arn
 }
 
-output "app_iam_user" {
+output "app_iam_role" {
   description = <<-EOT
-    IAM user whose access keys the pods use. Create the key pair with:
-      aws iam create-access-key --user-name <this value>
-    Keys are deliberately not managed by Terraform — see iam.tf.
+    IAM role the pods' AWS access comes from. There is no IAM user and no access key
+    to mint: pods inherit this role from the worker instance via the metadata service
+    (see iam.tf). Inspect what they may do with:
+      aws iam get-role-policy --role-name <this value> --policy-name <this value>-app
   EOT
-  value       = aws_iam_user.app.name
+  value       = module.k8s_cluster.worker_iam_role_name
 }
 
 # Convenience shape for copying into the ConfigMap in one step, rather than

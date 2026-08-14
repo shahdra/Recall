@@ -28,19 +28,37 @@ it grants full account access and cannot be scoped or revoked independently.
 | `AWS_ACCESS_KEY_ID` | an IAM key that can create VPC/EC2/IAM/DynamoDB/S3/SNS resources |
 | `AWS_SECRET_ACCESS_KEY` | its secret |
 | `SSH_PRIVATE_KEY` | the **full contents** of `~/.ssh/shahd-key.pem`, including the BEGIN/END lines |
-| `RECALL_ENV` | `KEY=VALUE` lines: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `DEEPGRAM_API_KEY` |
+| `RECALL_ENV` | **one line:** `DEEPGRAM_API_KEY=...` |
 
-`RECALL_ENV` becomes the `recall-secrets` Kubernetes Secret in *both* `dev` and `prod`.
-Its AWS pair should be the `shahdra-recall-us-east-1-app` user's keys — not the
-provisioning keys above, which are far more privileged. Mint them with:
+The full content of `RECALL_ENV` is:
 
-```bash
-aws iam create-access-key --user-name shahdra-recall-us-east-1-app
+```
+DEEPGRAM_API_KEY=<the value from services/tutor-agent/.env>
 ```
 
-> Do **not** put `RECALL_DEMO_MODE` in `RECALL_ENV`. It lands in both namespaces, and
-> the ⏩ day offset is process-wide — demo mode in prod shifts the review clock for
-> every user. `bootstrap.sh` rejects it outright. Dev gets it from
+No quotes, no `export`, no blank lines. Get it with:
+
+```bash
+grep '^DEEPGRAM_API_KEY=' services/tutor-agent/.env | pbcopy
+```
+
+It becomes the `recall-secrets` Kubernetes Secret in *both* `dev` and `prod`, and you
+set it **once** — it never goes stale, because there is no AWS key in it to expire or be
+deleted by a `terraform destroy`.
+
+> **No AWS credentials go in `RECALL_ENV`.** Pods inherit the worker node's IAM role
+> through the instance metadata service (`infra/terraform/iam.tf`). Worse than
+> unnecessary, an AWS key here is actively harmful: boto3 *prefers* an explicit
+> environment variable over the instance role, so a stale key silently shadows a
+> working role and pods fail with `InvalidClientTokenId`. `bootstrap.sh` warns if it
+> finds one.
+>
+> The `AWS_ACCESS_KEY_ID` secret above is a *separate* thing — it is Terraform's
+> provisioning credential, and far more privileged. Do not confuse the two.
+
+> Do **not** put `RECALL_DEMO_MODE` in `RECALL_ENV` either. It lands in both
+> namespaces, and the ⏩ day offset is process-wide — demo mode in prod shifts the
+> review clock for every user. `bootstrap.sh` rejects it outright. Dev gets it from
 > `infra/k8s/dev/configmap.yaml` instead.
 
 Setting `AWS_*` here means GitHub Actions can create billable AWS resources on a

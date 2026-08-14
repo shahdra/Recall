@@ -145,11 +145,31 @@ resource "aws_iam_instance_profile" "control_plane" {
 # IAM — workers
 # ---------------------------------------------------------------------------
 #
-# RECALL NOTE: these roles grant SSM and ECR only - NOT DynamoDB, S3, SNS, or
-# Bedrock. The application pods do not use the node role; they authenticate with
-# static keys from the `recall-secrets` Kubernetes Secret, created out-of-band by
-# bootstrap.sh. There is no IRSA on a kubeadm cluster (no OIDC provider), so pod-
-# level IAM is not available without extra machinery.
+# HOW APPLICATION PODS GET AWS CREDENTIALS.
+#
+# They inherit this NODE role through the instance metadata service. boto3's default
+# credential chain finds it with no configuration and no code change - nothing in
+# services/ reads AWS_ACCESS_KEY_ID explicitly - and the credentials it hands out are
+# short-lived and rotated by AWS.
+#
+# The alternative, which this deliberately replaced, was static access keys for a
+# dedicated IAM user, delivered through the `recall-secrets` Secret. That works, and
+# it scopes access per-workload rather than per-node, but it created a treadmill:
+# `terraform destroy` deletes the user, so its keys die with every teardown and every
+# consumer of them (a GitHub secret, a local env file) goes stale on a cycle this
+# project runs nightly. Keys that must be re-minted and re-pasted on each apply get
+# re-pasted wrong.
+#
+# WHAT THIS GIVES UP: the role is attached to the INSTANCE, so every pod scheduled on
+# a worker gets these permissions, not just Recall's four. Pod-level scoping is what
+# IRSA provides, and IRSA needs an OIDC provider that a kubeadm cluster does not have.
+# On a single-tenant lab cluster that is destroyed nightly the distinction costs
+# nothing; on a shared production cluster it would be unacceptable.
+#
+# The policy itself is unchanged and still least-privilege - the same document that
+# scoped the IAM user now scopes this role. It is passed in from the root module
+# (see iam.tf) rather than defined here, because every ARN in it belongs to a
+# data-plane resource the root module owns.
 resource "aws_iam_role" "worker" {
   name               = "${var.cluster_name}-worker"
   assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
@@ -185,6 +205,18 @@ resource "aws_iam_role_policy" "worker_ssm_read" {
   name   = "${var.cluster_name}-worker-ssm"
   role   = aws_iam_role.worker.id
   policy = data.aws_iam_policy_document.worker_ssm_read.json
+}
+
+# The application's own permissions: DynamoDB on the three tables and the GSI, S3
+# under uploads/, SNS publish, and Bedrock InvokeModel on two models. Every statement
+# is scoped to a named ARN - see iam.tf, which builds this document.
+#
+# Attached as an inline policy rather than a managed one so it cannot be attached to
+# anything else by accident, and so it is deleted with the role.
+resource "aws_iam_role_policy" "worker_app" {
+  name   = "${var.cluster_name}-worker-app"
+  role   = aws_iam_role.worker.id
+  policy = var.app_policy_json
 }
 
 resource "aws_iam_instance_profile" "worker" {

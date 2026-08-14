@@ -73,6 +73,20 @@ variable "ssh_ingress_cidr" {
   type        = string
 }
 
+variable "app_policy_json" {
+  description = <<-EOT
+    IAM policy document (JSON) granting the application's AWS access — DynamoDB, S3,
+    SNS, Bedrock. Attached inline to the WORKER NODE role, which is how pods get
+    credentials: boto3's default chain picks them up from the instance metadata
+    service with no code change.
+
+    Passed in rather than defined in this module because every ARN in it belongs to a
+    data-plane resource the ROOT module owns (see iam.tf). A cluster module that
+    hard-coded table ARNs would not be reusable.
+  EOT
+  type        = string
+}
+
 variable "owner" {
   description = <<-EOT
     Owner tag value, repeated onto ASG-launched instances. Terraform's provider-level

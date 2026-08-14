@@ -26,6 +26,15 @@ output "worker_security_group_id" {
   value       = aws_security_group.worker.id
 }
 
+output "worker_iam_role_name" {
+  description = <<-EOT
+    Worker node IAM role. This is where the application's AWS permissions live — pods
+    inherit it through the instance metadata service, so there is no IAM user and no
+    access key anywhere in the stack.
+  EOT
+  value       = aws_iam_role.worker.name
+}
+
 output "worker_asg_name" {
   description = "Worker Auto Scaling Group name, for scaling without a terraform apply."
   value       = aws_autoscaling_group.workers.name

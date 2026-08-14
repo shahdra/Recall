@@ -173,4 +173,9 @@ module "k8s_cluster" {
 
   ssh_key_name     = var.ssh_key_name
   ssh_ingress_cidr = var.ssh_ingress_cidr
+
+  # The application's AWS permissions, attached to the worker NODE role. Pods inherit
+  # it via the instance metadata service, so there are no static access keys anywhere
+  # — see iam.tf for why that replaced the IAM-user-plus-Secret approach.
+  app_policy_json = data.aws_iam_policy_document.app.json
 }

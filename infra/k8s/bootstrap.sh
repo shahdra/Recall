@@ -33,13 +33,16 @@
 #     short (flaky) or too long (slow)
 #
 # Required environment:
-#   RECALL_ENV_FILE  path to an env file (KEY=VALUE lines) holding
-#                    AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, DEEPGRAM_API_KEY.
+#   RECALL_ENV_FILE  path to an env file (KEY=VALUE lines) holding DEEPGRAM_API_KEY.
 #                    Becomes the `recall-secrets` Secret in both dev and prod. Every
-#                    workload consumes it via envFrom, so a missing one means pods in
+#                    workload consumes it via envFrom, so a missing file means pods in
 #                    CreateContainerConfigError. See
-#                    infra/k8s/secrets-templates/dev-secret.example.yaml for the keys
-#                    and where each value comes from.
+#                    infra/k8s/secrets-templates/dev-secret.example.yaml.
+#
+#                    NO AWS CREDENTIALS GO IN HERE. Pods inherit the worker node's IAM
+#                    role through the instance metadata service, so there is no access
+#                    key to deliver — and an explicit key would SHADOW the role, since
+#                    boto3 prefers env vars over the instance profile.
 # Optional environment:
 #   REPO_DIR         repo checkout on this node (default: $HOME/Recall). Needed for
 #                    the ArgoCD Application manifests.
@@ -79,19 +82,36 @@ command -v kubectl >/dev/null || fail "kubectl not found. Did control-plane user
 Check:  sudo tail -50 /var/log/user-data.log"
 
 [ -n "${RECALL_ENV_FILE:-}" ] || fail "RECALL_ENV_FILE is required.
-It must point at an env file with AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and
-DEEPGRAM_API_KEY. Without it the app pods cannot start. Locally the Deepgram key
-lives in services/tutor-agent/.env; the AWS pair comes from
-  aws iam create-access-key --user-name shahdra-recall-us-east-1-app"
+It must point at an env file containing DEEPGRAM_API_KEY. Without it the app pods
+cannot start. Locally that key lives in services/tutor-agent/.env, so:
+  grep '^DEEPGRAM_API_KEY=' services/tutor-agent/.env > /tmp/recall.env
+No AWS credentials are needed — pods inherit the worker node's IAM role."
 [ -f "$RECALL_ENV_FILE" ] || fail "RECALL_ENV_FILE=$RECALL_ENV_FILE does not exist."
 [ -s "$RECALL_ENV_FILE" ] || fail "RECALL_ENV_FILE=$RECALL_ENV_FILE is empty."
 
-# Check the three keys are present BEFORE spending 8 minutes on a bootstrap whose
+# Check the required key is present BEFORE spending 8 minutes on a bootstrap whose
 # pods will then fail to start. grep on an anchored key= pattern, so a value that
 # happens to contain the string does not count as the key.
-for key in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY DEEPGRAM_API_KEY; do
-  grep -qE "^${key}=" "$RECALL_ENV_FILE" \
-    || fail "$RECALL_ENV_FILE is missing $key. See infra/k8s/secrets-templates/dev-secret.example.yaml"
+#
+# DEEPGRAM_API_KEY is the only secret the env file needs. AWS credentials are NOT in
+# here: pods inherit the worker node's IAM role through the instance metadata service
+# (see infra/terraform/iam.tf), so there is no access key to deliver.
+grep -qE "^DEEPGRAM_API_KEY=" "$RECALL_ENV_FILE" \
+  || fail "$RECALL_ENV_FILE is missing DEEPGRAM_API_KEY. See infra/k8s/secrets-templates/dev-secret.example.yaml"
+
+# Warn, rather than fail, if AWS keys are still present. They are harmless but
+# misleading: boto3's credential chain prefers explicit env vars over the instance
+# role, so a stale key here SHADOWS the node role and the pods fail with
+# InvalidClientTokenId while the role sitting right there would have worked. That is a
+# genuinely confusing failure, so it is worth calling out loudly.
+for key in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+  if grep -qE "^${key}=" "$RECALL_ENV_FILE"; then
+    echo "WARNING: $RECALL_ENV_FILE sets $key." >&2
+    echo "  Pods now inherit AWS credentials from the worker node's IAM role, so this" >&2
+    echo "  is not needed — and boto3 PREFERS an explicit env var over the role, so a" >&2
+    echo "  stale value here will shadow a working role. Remove it unless you know why" >&2
+    echo "  you want it." >&2
+  fi
 done
 
 # RECALL_DEMO_MODE must NOT reach prod: the ⏩ control's day offset is process-wide,

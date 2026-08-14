@@ -240,12 +240,17 @@ jobs:
 
       - name: Stage the recall-secrets env file on the control plane
         run: |
-          # The app credentials (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
-          # DEEPGRAM_API_KEY) that become the recall-secrets Secret in both dev and
+          # DEEPGRAM_API_KEY, which becomes the recall-secrets Secret in both dev and
           # prod. Deliberately not in git — see
-          # infra/k8s/secrets-templates/dev-secret.example.yaml for where each comes
-          # from. bootstrap.sh validates all three keys are present before doing any
-          # work, so a malformed secret fails fast rather than eight minutes in.
+          # infra/k8s/secrets-templates/dev-secret.example.yaml.
+          #
+          # This is the ONLY secret the app needs. AWS credentials are not here: pods
+          # inherit the worker node's IAM role via the instance metadata service (see
+          # infra/terraform/iam.tf), which is what makes this secret stable across
+          # destroy/re-apply cycles — there is no key to re-mint.
+          #
+          # bootstrap.sh validates the key is present before doing any work, so a
+          # malformed secret fails fast rather than eight minutes in.
           printf '%s\n' "${{ secrets.RECALL_ENV }}" > /tmp/recall.env
           test -s /tmp/recall.env || { echo "::error::RECALL_ENV secret is empty or unset"; exit 1; }
           scp /tmp/recall.env "ubuntu@${CP_IP}:/tmp/recall.env"
