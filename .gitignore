@@ -46,3 +46,6 @@ out/
 .idea/
 .vscode/
 *.swp
+
+# Subagent-driven-development scratch (ledger, briefs, review packages).
+.superpowers/

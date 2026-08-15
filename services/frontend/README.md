@@ -59,28 +59,28 @@ npm run build
 npx next start -p 7510            # http://localhost:7510
 ```
 
-Then walk through:
+Then walk through the five routes:
 
-1. **Add material** — paste a few paragraphs, name the deck, press *Make
-   flashcards*. Expect a toast with the card count and an automatic switch to
-   Study. (Card generation calls the real model, so allow a few seconds.)
-2. **Study** — answer correctly and check the ✓, the explanation, and "Next
-   review in N days". Answer wrongly and confirm it comes back in 1 day.
-3. **Mic** — press the mic, speak, press stop. The transcript should fill the
-   answer box. On failure you get a message telling you to type instead, and
-   typing still works.
-4. **Progress** — cards reviewed, accuracy, and any weak topics should match what
-   you just did.
-5. **Reload the page** — Progress should still show your history, proving the
-   learner profile persisted.
+1. **`/` (Home)** — shows the due-card count once the learner id loads.
+2. **`/add`** — paste a few paragraphs, name the deck, press *Make flashcards*.
+   Expect a toast with the card count and a redirect into Study. (Card
+   generation calls the real model, so allow a few seconds.)
+3. **`/study`** — pick a deck from the pile view.
+4. **`/study/[deckId]`** — answer correctly and check the ✓, the explanation,
+   and "Next review in N days". Answer wrongly and confirm it comes back in 1
+   day. Try the mic: press it, speak, press stop — the transcript should fill
+   the answer box. On failure you get a message telling you to type instead,
+   and typing still works.
+5. **`/progress`** — cards reviewed, accuracy, and any weak topics should
+   match what you just did. Reload the page and confirm the same history
+   still shows, proving the learner profile persisted.
 
-### Automated versions
+### Automated version
 
-Two Playwright harnesses cover the same ground and are meant to be run by hand
-against a live stack (they are not part of CI, and are excluded from the image):
+One Playwright harness covers part of this and is meant to be run by hand
+against a live stack (it is not part of CI, and is excluded from the image):
 
 ```bash
-node smoke.mjs         # walks all three screens, writes /tmp/shot-*.png
 node voice-check.mjs   # browser WebM/Opus recording -> /transcribe
 ```
 
