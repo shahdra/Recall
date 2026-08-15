@@ -151,7 +151,7 @@ export default function StudyPage() {
         </div>
       ) : loadError ? (
         <div className="space-y-2 py-12 text-center">
-          <p className="font-medium">Couldn't load your decks.</p>
+          <p className="font-medium">Couldn&apos;t load your decks.</p>
           <p className="text-sm text-muted-foreground">
             Check your connection and try again.
           </p>

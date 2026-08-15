@@ -26,6 +26,7 @@ export default function ProgressView({ userId }: Props) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    if (!userId) return;
     let active = true;
 
     async function load() {

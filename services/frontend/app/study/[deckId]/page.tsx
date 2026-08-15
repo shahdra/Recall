@@ -115,7 +115,7 @@ export default function StudyDeckPage() {
         <p className="mt-1 text-sm text-muted-foreground">
           {otherDue > 0
             ? `${otherDue} card${otherDue === 1 ? "" : "s"} still due in your other decks.`
-            : "That's everything due — nice work."}
+            : "That&apos;s everything due — nice work."}
         </p>
         <Link
           href="/study"
