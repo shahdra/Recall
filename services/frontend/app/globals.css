@@ -44,14 +44,33 @@
 }
 
 @layer utilities {
-  /* The flip animation for revealing a card's answer. */
+  /* 3D flip primitives. Tailwind ships no transform-style or backface utilities,
+     so these are the minimum needed for a two-sided card. */
   .preserve-3d {
     transform-style: preserve-3d;
   }
   .backface-hidden {
     backface-visibility: hidden;
+    /* Safari still needs the prefix. Without it BOTH faces render and the back
+       shows through the front as mirrored text. */
+    -webkit-backface-visibility: hidden;
   }
   .rotate-y-180 {
     transform: rotateY(180deg);
+  }
+  .perspective-card {
+    perspective: 1500px;
+  }
+}
+
+/* Reduced motion: collapse card transitions to instant rather than removing them.
+   The state change still happens — the answer still appears, the next card still
+   arrives — it just does not travel. Removing the animation outright would leave
+   someone who prefers less motion unable to tell that the card changed. */
+@media (prefers-reduced-motion: reduce) {
+  .card-motion,
+  .card-motion * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
   }
 }
