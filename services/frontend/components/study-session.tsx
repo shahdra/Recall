@@ -1,7 +1,7 @@
 "use client";
 
 import { Loader2, Mic, RotateCcw, Square } from "lucide-react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { submitAnswer, transcribe } from "@/lib/api";
@@ -35,6 +35,25 @@ export default function StudySession({ userId, cards, deckTitle, onFinished }: P
 
   const recorder = useRecorder();
   const answerRef = useRef<HTMLTextAreaElement>(null);
+
+  /**
+   * Release the microphone when this component goes away.
+   *
+   * Without this, navigating away mid-recording — clicking "All decks", the back
+   * button, anything that unmounts the session — leaves the MediaStream's tracks
+   * live. The browser keeps showing its recording indicator and the OS keeps the
+   * mic held open, with no UI left to stop it: the only way out is closing the tab.
+   *
+   * `cancel` (not `stop`) because we are discarding, not submitting: it detaches the
+   * MediaRecorder's onstop handler before stopping, so no orphaned callback tries to
+   * set state on an unmounted component.
+   *
+   * `recorder.cancel` is a useCallback whose only dependency is itself stable, so
+   * this effect does not re-run on every render.
+   */
+  useEffect(() => {
+    return () => recorder.cancel();
+  }, [recorder.cancel]);
 
   const card = cards[index];
   const remaining = cards.length - index;
