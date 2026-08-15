@@ -10,7 +10,6 @@ import { formatPercent } from "@/lib/utils";
 
 interface Props {
   userId: string;
-  reloadKey: number;
 }
 
 /** The weakest topics, worst first — mirrors how the tutor's prompt is built. */
@@ -21,7 +20,7 @@ function weakestTopics(profile: LearnerProfile): Array<[string, number]> {
     .slice(0, 5);
 }
 
-export default function ProgressView({ userId, reloadKey }: Props) {
+export default function ProgressView({ userId }: Props) {
   const [profile, setProfile] = useState<LearnerProfile | null>(null);
   const [dueCount, setDueCount] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -50,7 +49,7 @@ export default function ProgressView({ userId, reloadKey }: Props) {
     return () => {
       active = false;
     };
-  }, [userId, reloadKey]);
+  }, [userId]);
 
   if (loading) {
     return (
