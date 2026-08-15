@@ -22,15 +22,19 @@ export default function StudyPage() {
   const [totalDue, setTotalDue] = useState(0);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState(false);
   const [simulatedDate, setSimulatedDate] = useState<string | null>(null);
   const [clockBusy, setClockBusy] = useState(false);
   /** Bumped to re-run the load after the clock moves. */
   const [clockKey, setClockKey] = useState(0);
+  /** Bumped by "Try again" after a failed load. */
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     if (!userId) return;
     let active = true;
     setLoading(true);
+    setLoadError(false);
     startSession(userId)
       .then((session) => {
         if (!active) return;
@@ -41,7 +45,7 @@ export default function StudyPage() {
       .catch((error) => {
         if (!active) return;
         toast.error(error instanceof Error ? error.message : "Couldn't load your decks.");
-        setMessage("Couldn't load your decks.");
+        setLoadError(true);
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -49,7 +53,7 @@ export default function StudyPage() {
     return () => {
       active = false;
     };
-  }, [userId, clockKey]);
+  }, [userId, clockKey, reloadKey]);
 
   // Whether the demo clock exists is a property of the deployment, not the
   // learner, so this runs once rather than on every reload.
@@ -96,9 +100,11 @@ export default function StudyPage() {
 
       <h1 className="mb-2 text-2xl font-bold tracking-tight">Study</h1>
       <p className="mb-6 text-sm text-muted-foreground">
-        {totalDue > 0
-          ? `${totalDue} card${totalDue === 1 ? "" : "s"} due. Pick a deck to begin.`
-          : "Nothing due right now."}
+        {loadError
+          ? "Couldn't load your decks."
+          : totalDue > 0
+            ? `${totalDue} card${totalDue === 1 ? "" : "s"} due. Pick a deck to begin.`
+            : "Nothing due right now."}
       </p>
 
       {/* Rendered on the empty state as well as the populated one: "nothing is due,
@@ -142,6 +148,20 @@ export default function StudyPage() {
         <div className="flex flex-col items-center gap-3 py-16 text-muted-foreground">
           <Loader2 className="h-5 w-5 animate-spin" />
           <p className="text-sm">Loading your decks…</p>
+        </div>
+      ) : loadError ? (
+        <div className="space-y-2 py-12 text-center">
+          <p className="font-medium">Couldn't load your decks.</p>
+          <p className="text-sm text-muted-foreground">
+            Check your connection and try again.
+          </p>
+          <button
+            type="button"
+            onClick={() => setReloadKey((k) => k + 1)}
+            className="mt-2 inline-block rounded-lg border bg-card px-4 py-2 text-sm font-medium hover:bg-muted"
+          >
+            Try again
+          </button>
         </div>
       ) : totalDue === 0 ? (
         <div className="space-y-2 py-12 text-center">
