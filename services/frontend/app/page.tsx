@@ -4,6 +4,7 @@ import { BarChart3, BookOpen, Upload } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 
+import ThemeToggle from "@/components/theme-toggle";
 import { startSession } from "@/lib/api";
 import { useUserId } from "@/lib/use-user-id";
 
@@ -28,11 +29,14 @@ export default function Home() {
 
   return (
     <main className="mx-auto flex min-h-screen max-w-3xl flex-col justify-center px-4 py-10">
-      <header className="mb-8">
-        <h1 className="text-3xl font-bold tracking-tight">Recall</h1>
-        <p className="mt-1.5 text-muted-foreground">
-          Turns your material into a quiz that learns what you don&apos;t know.
-        </p>
+      <header className="mb-8 flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-3xl font-bold tracking-tight">Recall</h1>
+          <p className="mt-1.5 text-muted-foreground">
+            Turns your material into a quiz that learns what you don&apos;t know.
+          </p>
+        </div>
+        <ThemeToggle />
       </header>
 
       <div className="grid gap-4 sm:grid-cols-3">

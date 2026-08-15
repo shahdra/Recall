@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import DeckStack from "@/components/deck-stack";
+import ThemeToggle from "@/components/theme-toggle";
 import { advanceClock, getHealth, resetClock, startSession } from "@/lib/api";
 import type { DueDeck } from "@/lib/types";
 import { useUserId } from "@/lib/use-user-id";
@@ -90,13 +91,16 @@ export default function StudyPage() {
 
   return (
     <main className="mx-auto flex min-h-screen max-w-4xl flex-col px-4 py-6">
-      <Link
-        href="/"
-        className="mb-4 inline-flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
-      >
-        <ArrowLeft className="h-4 w-4" />
-        Home
-      </Link>
+      <div className="mb-4 flex items-center justify-between gap-4">
+        <Link
+          href="/"
+          className="inline-flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          Home
+        </Link>
+        <ThemeToggle />
+      </div>
 
       <h1 className="mb-2 text-2xl font-bold tracking-tight">Study</h1>
       <p className="mb-6 text-sm text-muted-foreground">

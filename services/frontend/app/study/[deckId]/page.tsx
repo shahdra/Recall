@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import StudySession from "@/components/study-session";
+import ThemeToggle from "@/components/theme-toggle";
 import { startSession } from "@/lib/api";
 import type { Card } from "@/lib/types";
 import { useUserId } from "@/lib/use-user-id";
@@ -129,13 +130,16 @@ export default function StudyDeckPage() {
 
   return (
     <main className="mx-auto flex min-h-screen max-w-4xl flex-col px-4 py-6">
-      <Link
-        href="/study"
-        className="mb-4 inline-flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
-      >
-        <ArrowLeft className="h-4 w-4" />
-        All decks
-      </Link>
+      <div className="mb-4 flex items-center justify-between gap-4">
+        <Link
+          href="/study"
+          className="inline-flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50"
+        >
+          <ArrowLeft className="h-4 w-4" />
+          All decks
+        </Link>
+        <ThemeToggle />
+      </div>
 
       <StudySession
         userId={userId}
