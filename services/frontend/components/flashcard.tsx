@@ -58,9 +58,21 @@ export default function Flashcard({
         <div aria-hidden className="invisible flex flex-col gap-3 p-6">
           <p className="text-xl font-semibold leading-snug">{card.front}</p>
           <p className="leading-relaxed">{card.back}</p>
-          {submitted && <p className="text-sm">{submitted}</p>}
-          {verdict && <p className="text-sm leading-relaxed">{verdict.explanation}</p>}
-          <p className="text-xs">Next review placeholder line</p>
+          <p className="rounded-lg border border-dashed px-3 py-2 text-xs">
+            You said: <span className="font-medium">{submitted.trim() || "— nothing —"}</span>
+          </p>
+          {verdict && (
+            <div className="flex items-start gap-3 rounded-lg border p-3">
+              <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full" />
+              <div className="space-y-1">
+                <p className="text-sm font-semibold">
+                  Not quite<span className="ml-2 text-xs font-normal">graded {verdict.quality}/5</span>
+                </p>
+                <p className="text-xs leading-relaxed">{verdict.explanation}</p>
+                <p className="text-[11px]">Next review placeholder line</p>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* ---- FRONT: the question ---- */}
