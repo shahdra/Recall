@@ -178,4 +178,34 @@ module "k8s_cluster" {
   # it via the instance metadata service, so there are no static access keys anywhere
   # — see iam.tf for why that replaced the IAM-user-plus-Secret approach.
   app_policy_json = data.aws_iam_policy_document.app.json
+
+  # Lets the Alertmanager pod publish to SNS with the node's own credentials.
+  alerts_topic_arn = aws_sns_topic.alerts.arn
+}
+
+# --- The public front door ---------------------------------------------------
+#
+# ALB -> ingress-nginx -> the services, with Route 53 names and an ACM certificate,
+# so Recall is reachable at https://recall.fursa.click rather than at a NodePort on
+# an IP that changes whenever the ASG replaces an instance.
+#
+# Depends on the cluster module for the worker ASG and its security group, which is
+# why it is declared after it — Terraform infers the ordering from the references.
+module "ingress" {
+  source = "./modules/ingress"
+
+  cluster_name = local.name_prefix
+
+  vpc_id     = module.vpc.vpc_id
+  subnet_ids = module.vpc.public_subnets
+
+  worker_asg_name          = module.k8s_cluster.worker_asg_name
+  worker_security_group_id = module.k8s_cluster.worker_security_group_id
+
+  # MUST match controller.service.nodePorts.http in
+  # infra/k8s/ingress-nginx/values.yaml. bootstrap.sh asserts they agree.
+  ingress_http_node_port = var.ingress_http_node_port
+
+  base_domain = var.base_domain
+  subdomain   = var.subdomain
 }

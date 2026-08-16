@@ -141,6 +141,54 @@ output "fetch_kubeconfig_command" {
   value       = "scp -i ${var.ssh_private_key_path} ubuntu@${module.k8s_cluster.control_plane_public_ip}:${module.k8s_cluster.kubeconfig_path_on_control_plane} ~/.kube/config-recall"
 }
 
+# ===========================================================================
+# Ingress and alerting
+# ===========================================================================
+#
+# The first three are read by infra/k8s/bootstrap.sh, not by a human: the committed
+# Helm values file carries __DOMAIN_ROOT__ / __ALERTS_SNS_TOPIC_ARN__ / __AWS_REGION__
+# placeholders that bootstrap substitutes from these before running helm. They cannot
+# be committed literally because none is knowable until after apply.
+
+output "domain_root" {
+  description = "Recall's domain root, e.g. recall.fursa.click. Substituted into the monitoring Helm values."
+  value       = module.ingress.domain_root
+}
+
+output "alerts_sns_topic_arn" {
+  description = "SNS topic Alertmanager publishes to. Substituted into the monitoring Helm values."
+  value       = aws_sns_topic.alerts.arn
+}
+
+output "ingress_http_node_port" {
+  description = "NodePort the ALB forwards to. bootstrap.sh asserts the installed chart matches it."
+  value       = var.ingress_http_node_port
+}
+
+output "alb_dns_name" {
+  description = <<-EOT
+    The ALB's own hostname. When a published URL fails, this separates a DNS problem
+    from a routing one:
+      curl -H 'Host: recall.fursa.click' http://<this>
+    reaches the ingress controller without involving Route 53 at all.
+  EOT
+  value       = module.ingress.alb_dns_name
+}
+
+output "ingress_target_group_arn" {
+  description = <<-EOT
+    Target group the worker ASG is attached to. First thing to check when every
+    hostname returns 503:
+      aws elbv2 describe-target-health --target-group-arn <this>
+  EOT
+  value       = module.ingress.target_group_arn
+}
+
+output "public_urls" {
+  description = "Every published hostname as a browsable https URL."
+  value       = module.ingress.urls
+}
+
 output "recall_urls" {
   description = <<-EOT
     Where the app is reachable once the manifests are synced. These point at the
