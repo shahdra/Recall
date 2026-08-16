@@ -1,0 +1,40 @@
+# ServiceMonitor — tells the Prometheus operator to scrape Recall's own metrics.
+#
+# The operator picks this up because infra/k8s/monitoring/values.yaml sets
+# serviceMonitorSelectorNilUsesHelmValues=false. Without that, the operator would
+# only select monitors labelled `release: kube-prometheus-stack`, silently ignore
+# this one, and Prometheus would come up healthy with no Recall targets at all.
+#
+# Verify it landed:
+#   kubectl -n dev get servicemonitor
+#   ...then the Prometheus UI -> Status -> Targets (tutor-agent should be UP)
+#
+# ── Only tutor-agent is scraped ─────────────────────────────────────────────
+# study-mcp exposes no /metrics endpoint: it speaks MCP, not HTTP, on its main port
+# and was never instrumented. The frontend is a Next.js server with nothing
+# Prometheus-shaped to offer, and the reminder is a CronJob that exits — a scrape
+# target has to be running to be scraped. So the agent is the whole surface, which
+# is fine because it is where every interesting failure happens: the LLM calls, the
+# tool calls, and the grading.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: tutor-agent
+  namespace: dev
+  labels:
+    app: tutor-agent
+    release: kube-prometheus-stack
+spec:
+  # Scope the search to this namespace. Without it the monitor would match the
+  # identically-labelled Service in the OTHER environment too, and dev metrics would
+  # land under prod's job.
+  namespaceSelector:
+    matchNames: [dev]
+  selector:
+    matchLabels:
+      app: tutor-agent
+  endpoints:
+    - port: http # the named port on the tutor-agent Service (8000)
+      path: /metrics # exposed by prometheus-fastapi-instrumentator
+      interval: 15s
+      scrapeTimeout: 10s

@@ -1,0 +1,36 @@
+# StorageClass for EBS-backed PersistentVolumes.
+#
+# Applied by infra/k8s/bootstrap.sh, right after the EBS CSI driver it depends on.
+#
+# Recall's own four workloads are stateless — their state lives in DynamoDB — so
+# nothing needed this until the monitoring stack arrived. Prometheus and Grafana
+# both claim PVCs against `ebs-sc` (see infra/k8s/monitoring/values.yaml), and
+# without this class those claims sit Pending forever and neither pod ever starts.
+#
+# ── WaitForFirstConsumer is the load-bearing line ──────────────────────────
+# The default, Immediate, provisions the volume as soon as the claim exists — in
+# whichever Availability Zone the controller happens to pick. An EBS volume cannot
+# cross AZs, so if the scheduler later places the pod on a node in the other AZ,
+# the pod is unschedulable forever with a "volume node affinity conflict" that
+# names no obvious cause. Recall's workers span two AZs, so this is not
+# hypothetical. WaitForFirstConsumer delays provisioning until the pod is
+# scheduled, then creates the volume in that node's AZ.
+#
+# ── Cost note for teardown ─────────────────────────────────────────────────
+# Volumes provisioned through this class are created by the CSI CONTROLLER, not by
+# Terraform, so `terraform destroy` cannot see them and they survive it as orphaned
+# EBS that keeps billing. Delete the PVCs before destroying — RUNBOOK.md §7 has the
+# procedure and the query to find strays.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-sc
+provisioner: ebs.csi.aws.com
+# See the note above — this is what keeps a two-AZ cluster schedulable.
+volumeBindingMode: WaitForFirstConsumer
+# Lets a volume be grown in place later. Shrinking is never possible on EBS.
+allowVolumeExpansion: true
+parameters:
+  # gp3 rather than gp2: same durability, cheaper per GiB, and baseline 3000 IOPS
+  # without paying for provisioned capacity.
+  type: gp3

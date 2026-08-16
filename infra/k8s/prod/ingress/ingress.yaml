@@ -1,0 +1,97 @@
+# Ingress — recall.fursa.click (the domain root)
+#
+# ONE hostname serves both the frontend and the tutor-agent, split by path. That is
+# not a stylistic choice; it is what the frontend requires.
+#
+# ── Why one host and not two ────────────────────────────────────────────────
+# services/frontend/lib/api.ts:21-35 derives the agent's URL in the BROWSER at
+# runtime, because NEXT_PUBLIC_* values are inlined at build time and would
+# otherwise mean one image per environment. Its rule is:
+#
+#     agent port = frontend port + 500        (prod 31300 -> 31800)
+#     ...but with NO explicit port, fall back to the SAME ORIGIN
+#
+# Behind the ALB the page is served from https://recall.fursa.click with no port, so
+# that fallback fires and every API call goes to this same hostname. Giving the agent
+# its own host would break every request: the browser would keep calling the
+# frontend's host and receive the Next.js 404 page instead of JSON.
+#
+# ── Two paths are deliberately ABSENT here ──────────────────────────────────
+# /demo — the ⏩ clock control. Its offset is process-wide, so exposing it in prod
+#         would let any visitor shift the spaced-repetition schedule for every
+#         learner at once. RECALL_DEMO_MODE is also unset in the prod ConfigMap, so
+#         the endpoints would refuse anyway; not routing them is the second lock.
+# /metrics — Prometheus scrapes it in-cluster through the ServiceMonitor, which
+#         needs no Ingress. Publishing it would hand a stranger the request rates,
+#         error counts and model-failure history of the whole service.
+#
+# Both are present in the dev Ingress, where the trade is different: dev exists to
+# be poked at.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: recall-prod
+  namespace: prod
+  labels:
+    app.kubernetes.io/part-of: recall
+  annotations:
+    # Deck creation from a PDF is an LLM call over the whole document and regularly
+    # takes 30-90s; the controller's 60s default would return a 504 for a request
+    # that was going to succeed.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: recall.fursa.click
+      http:
+        paths:
+          # --- tutor-agent: the API paths the browser calls directly -----------
+          - path: /decks
+            pathType: Prefix
+            backend:
+              service:
+                name: tutor-agent
+                port:
+                  number: 8000
+          - path: /session
+            pathType: Prefix
+            backend:
+              service:
+                name: tutor-agent
+                port:
+                  number: 8000
+          - path: /transcribe
+            pathType: Prefix
+            backend:
+              service:
+                name: tutor-agent
+                port:
+                  number: 8000
+          - path: /chat
+            pathType: Prefix
+            backend:
+              service:
+                name: tutor-agent
+                port:
+                  number: 8000
+          # The frontend polls /health on load to decide whether to render the demo
+          # clock. In prod it always answers demo_mode: false, and the control stays
+          # hidden — but the call still has to succeed or the page logs an error.
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: tutor-agent
+                port:
+                  number: 8000
+
+          # --- frontend: everything else --------------------------------------
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 3000

@@ -1,0 +1,81 @@
+# Helm values for ingress-nginx.
+#
+# Installed by infra/k8s/bootstrap.sh:
+#   helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+#     -n ingress-nginx --values infra/k8s/ingress-nginx/values.yaml \
+#     --set controller.service.nodePorts.http=30080 ...
+#
+# The controller is the single HTTP entry point for the cluster: the ALB forwards
+# every request to its NodePort, and Ingress rules fan them out by Host header.
+
+controller:
+  service:
+    # NodePort, not LoadBalancer. A LoadBalancer Service would have Kubernetes
+    # create its own ELB per Service — but this is a plain kubeadm cluster with no
+    # AWS cloud-controller-manager, so that Service would sit <pending> forever.
+    # The ALB is provisioned by Terraform instead (infra/terraform/modules/ingress)
+    # and pointed at these fixed ports.
+    type: NodePort
+    nodePorts:
+      # PINNED, not left to Kubernetes' random 30000-32767 allocation, because the
+      # Terraform target group has to know the port before this chart is ever
+      # installed. bootstrap.sh asserts the installed Service matches
+      # var.ingress_http_node_port after the install — a silent mismatch means every
+      # hostname returns 503 with nothing in any pod log to explain it.
+      http: 30080
+      https: 30443
+
+  config:
+    # The ALB terminates TLS, so every request reaches nginx over plain HTTP with
+    # the original client's details in X-Forwarded-* headers. Without these three
+    # settings nginx reports the ALB's private IP as the client address in every
+    # log line and passes that to the app.
+    use-forwarded-headers: "true"
+    compute-full-forwarded-for: "true"
+    # PROXY protocol off: an ALB (unlike an NLB) does not speak it, and enabling it
+    # here makes nginx reject every request as malformed.
+    use-proxy-protocol: "false"
+    # Only trust X-Forwarded-For from inside the VPC — otherwise any client could
+    # spoof its own source address by setting the header.
+    proxy-real-ip-cidr: "10.0.0.0/16"
+
+    # PDF uploads go through this proxy on their way to /decks. The default is 1m,
+    # which silently rejects a normal lecture-slide deck with a 413.
+    proxy-body-size: "16m"
+    # Deck generation is an LLM call over the whole document and regularly takes
+    # 30-90s. The 60s default would cut it off mid-flight and return a 504 for a
+    # request that was going to succeed.
+    proxy-read-timeout: "180"
+    proxy-send-timeout: "180"
+
+  # One replica. Two would survive a node failure, but this cluster runs a single
+  # worker by default, so a second replica would just sit Pending.
+  replicaCount: 1
+
+  metrics:
+    # The controller's own Prometheus metrics: request rate, latency and response
+    # codes per Ingress host — one place to see everything entering the cluster.
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: monitoring
+      # The Prometheus operator's default selector requires this label. Our
+      # values.yaml sets serviceMonitorSelectorNilUsesHelmValues=false so it is not
+      # strictly needed, but the chart's own ServiceMonitor is created before that
+      # is guaranteed to be in effect, so it is set explicitly.
+      additionalLabels:
+        release: kube-prometheus-stack
+
+  ingressClassResource:
+    name: nginx
+    enabled: true
+    # Default class, so an Ingress with no ingressClassName still routes. Every
+    # Ingress in this repo names it explicitly anyway; this is belt and braces.
+    default: true
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi

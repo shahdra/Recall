@@ -1,0 +1,138 @@
+# PrometheusRule — Recall's own alerts, on the tutor-agent's metrics.
+#
+# The operator picks this up because infra/k8s/monitoring/values.yaml sets
+# ruleSelectorNilUsesHelmValues=false, and renders it into the rule ConfigMap
+# Prometheus loads. Check it landed with:
+#   kubectl -n dev get prometheusrule
+#   ...then Prometheus UI -> Alerts (all five listed, state Inactive)
+#
+# ── The metrics these are built on ──────────────────────────────────────────
+# prometheus-fastapi-instrumentator gives every endpoint:
+#   http_requests_total{handler,method,status}
+#   http_request_duration_seconds_bucket{handler,le}
+# and services/tutor-agent/metrics.py adds Recall's own:
+#   recall_llm_failures_total          model invocations that failed
+#   recall_llm_fallbacks_total         primary model abandoned for the fallback
+#   recall_tool_errors_total           tool calls that failed or named nothing
+#   recall_agent_capped_total          runs that hit the iteration cap
+#   recall_agent_iterations            histogram of model calls per run
+#
+# ── `for:` is the difference between an alert and a pager that cries wolf ───
+# A rule with no `for:` fires on a single scrape. Every rule below requires the
+# condition to hold for minutes first, so a blip during a rolling deploy sends no
+# mail. That window is also the Pending -> Firing transition you watch in the
+# Prometheus UI: PENDING for the whole `for:` duration, then FIRING.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: recall-alerts
+  namespace: dev
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: recall-availability
+      # How often the expressions below are evaluated.
+      interval: 30s
+      rules:
+        # ── CRITICAL: the agent is returning errors ──────────────────────────
+        # Ratio of 5xx to all responses over 5 minutes. rate() rather than
+        # increase(), so both sides are per-second and the division is
+        # dimensionless.
+        #
+        # The traffic guard on the denominator is what keeps this out of the inbox
+        # during a deploy: with no traffic both sides are 0 and the expression is
+        # NaN, which never fires — but with two requests, one of them a 5xx, the
+        # ratio is 50% off nothing. Requiring some real traffic first fixes that.
+        - alert: TutorAgentHighErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{namespace="dev", job="tutor-agent", status=~"5.."}[5m]))
+              /
+              sum(rate(http_requests_total{namespace="dev", job="tutor-agent"}[5m]))
+            ) > 0.10
+            and
+            sum(rate(http_requests_total{namespace="dev", job="tutor-agent"}[5m])) > 0.05
+          for: 3m
+          labels:
+            severity: critical
+            namespace: dev
+          annotations:
+            summary: "Tutor agent (dev) is failing more than 10% of requests"
+            description: >-
+              {{ $value | humanizePercentage }} of requests to the dev tutor-agent
+              returned 5xx over the last 5 minutes. Check
+              `kubectl -n dev logs deploy/tutor-agent --tail=100`.
+
+        # ── WARNING: a service disappeared ───────────────────────────────────
+        # `up` is synthesised by Prometheus for every target: 1 if the last scrape
+        # succeeded, 0 if it failed. This catches what the error-rate rule
+        # structurally CANNOT — a pod that is down serves no requests at all, so
+        # http_requests_total stops increasing and a ratio-based alert stays quiet
+        # forever.
+        - alert: TutorAgentDown
+          expr: up{namespace="dev", job="tutor-agent"} == 0
+          for: 2m
+          labels:
+            severity: warning
+            namespace: dev
+          annotations:
+            summary: "Tutor agent (dev) has been unreachable for 2 minutes"
+            description: >-
+              Prometheus cannot scrape tutor-agent at {{ $labels.instance }}. The pod
+              is down, crash-looping, or its Service has no ready endpoints.
+
+    - name: recall-model
+      interval: 30s
+      rules:
+        # ── CRITICAL: Bedrock is failing ─────────────────────────────────────
+        # An absolute rate, not a ratio: there is no natural denominator for "model
+        # calls attempted", and any sustained failure rate is worth knowing about.
+        # 0.05/s is roughly three failures a minute.
+        - alert: RecallLLMFailures
+          expr: rate(recall_llm_failures_total{namespace="dev"}[5m]) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+            namespace: dev
+          annotations:
+            summary: "Model invocations failing in dev"
+            description: >-
+              {{ $value | printf "%.3f" }} model failures/sec over 5 minutes. Usually
+              Bedrock throttling, an expired credential, or a model id outside the
+              account's allowlist — the last one fails every call, not some.
+
+        # ── WARNING: running on the fallback model ───────────────────────────
+        # Not an outage: the fallback answers, so the learner still gets a reply.
+        # But answers get worse, so it should be visible rather than silent.
+        # Different severity from the rule above is also what lets a future route
+        # send criticals to a phone and warnings to email.
+        - alert: RecallLLMFallbackSpike
+          expr: rate(recall_llm_fallbacks_total{namespace="dev"}[10m]) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            namespace: dev
+          annotations:
+            summary: "Falling back to the secondary model in dev"
+            description: >-
+              The primary model is being abandoned {{ $value | printf "%.3f" }}
+              times/sec. Answers still arrive but quality drops. Check
+              RecallLLMFailures for the cause.
+
+        # ── WARNING: the agent is not converging ─────────────────────────────
+        # A capped run returns without answering, so this is a user-visible failure
+        # that produces no 5xx — the endpoint returns 200 with a useless body, which
+        # is exactly the kind of thing an HTTP-only alert misses.
+        - alert: RecallAgentCapped
+          expr: rate(recall_agent_capped_total{namespace="dev"}[10m]) > 0.02
+          for: 10m
+          labels:
+            severity: warning
+            namespace: dev
+          annotations:
+            summary: "Agent runs hitting the iteration cap in dev"
+            description: >-
+              {{ $value | printf "%.3f" }} runs/sec ended at the iteration cap instead
+              of answering. Usually a tool erroring in a loop — check
+              recall_tool_errors_total.
