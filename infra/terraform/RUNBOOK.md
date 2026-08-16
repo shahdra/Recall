@@ -24,23 +24,32 @@ Two layers, one `terraform apply`:
 
 ## 0. What gets created
 
-**`Plan: 49 to add, 0 to change, 0 to destroy.`** — verified with
-`terraform plan` against the live AWS API on 2026-08-13, provider `hashicorp/aws`
+**`Plan: 70 to add, 0 to change, 0 to destroy.`** — verified with
+`terraform plan` against the live AWS API on 2026-08-16, provider `hashicorp/aws`
 v6.59.0.
+
+By layer: 12 data plane, 11 VPC, 27 cluster, 20 ingress.
 
 Everything carries `Owner=shahdra`, `Project=recall`, `ManagedBy=terraform`,
 `TFWorkspace=us-east-1` via the provider's `default_tags`.
 
-### Data plane — 11 resources
+### Data plane — 12 resources
 
 | # | Resource | Name |
 |---|---|---|
 | 3 | DynamoDB tables | `shahdra-recall-Cards` (with `due-index` GSI), `shahdra-recall-Decks`, `shahdra-recall-LearnerProfile` |
 | 1 | S3 bucket | `shahdra-recall-us-east-1-uploads-228281126655` |
 | 4 | S3 config | public-access-block, SSE-S3, versioning, lifecycle (expire uploads after 90d) |
-| 1 | SNS topic | `shahdra-recall-us-east-1-reminders` |
+| 1 | SNS topic | `shahdra-recall-us-east-1-reminders` — the learner-facing daily digest |
 | 1 | SNS topic policy | restricts publish to this account |
+| 1 | SNS topic | `shahdra-recall-us-east-1-alerts` — Alertmanager's operational alerts |
 | 1 | Guard | `terraform_data.workspace_region_guard` — no AWS resource, just a precondition |
+
+Two SNS topics, deliberately. `reminders` is a product feature learners subscribe to;
+`alerts` is operational. Merging them would mail every learner about a p95 latency
+breach and mail the operator about study reminders. An email subscription is added to
+`alerts` only when `alert_email` is set, and it needs one confirmation click before AWS
+delivers anything.
 
 Table names carry no region; the bucket and topic do. Tables are already
 region-scoped and one set serves both `dev` and `prod`, so a region in the name would
@@ -97,6 +106,53 @@ page whose every API request fails. **study-mcp is deliberately not exposed** �
 ClusterIP, reached only by tutor-agent inside the cluster, and publishing it would
 expose an unauthenticated tool API.
 
+### Ingress — 20 resources
+
+The public front door. Without it Recall is reachable only at
+`http://<node-ip>:30300`, an address that changes whenever the ASG replaces an
+instance.
+
+| # | Resource | Detail |
+|---|---|---|
+| 1 | ACM certificate | `recall.fursa.click` + `*.recall.fursa.click`, DNS-validated |
+| 2 | Validation records | the CNAMEs proving we control the domain |
+| 1 | Certificate validation | blocks the apply until ACM reports ISSUED |
+| 1 | ALB | internet-facing, across both public subnets |
+| 1 | Target group | port 30080, `target_type = instance`, health check `/healthz` |
+| 1 | ASG attachment | registers every worker the ASG launches, automatically |
+| 2 | Listeners | 443 HTTPS (forward), 80 HTTP (301 to HTTPS) |
+| 1 | ALB security group | + 3 rules: 443 and 80 in, 30080 out to the workers |
+| 1 | Worker ingress rule | 30080 from the ALB — **required**, see below |
+| 6 | Route 53 ALIAS records | the six hostnames |
+
+**Six hostnames, all ALIAS A-records pointing at the ALB:**
+
+| URL | Serves |
+|---|---|
+| `recall.fursa.click` | prod frontend + tutor-agent |
+| `dev.recall.fursa.click` | dev frontend + tutor-agent |
+| `argocd.recall.fursa.click` | ArgoCD UI |
+| `grafana.recall.fursa.click` | Grafana |
+| `prometheus.recall.fursa.click` | Prometheus (basic auth) |
+| `alertmanager.recall.fursa.click` | Alertmanager (basic auth) |
+
+**The hosted zone is read, never managed.** `fursa.click` is shared with every other
+student in the account, so it is a data source: `terraform destroy` removes our records
+and leaves the zone. The subdomain is `recall` rather than the student name precisely
+because the reference project uses that — two stacks sharing a subdomain would mean
+whichever applied second repointed the other's DNS at its own ALB.
+
+**Why the worker rule is required, not defensive.** The worker SG opens only
+30300–30800 and 31300–31800 — the ports the app serves. ingress-nginx listens on
+**30080**, outside both. Without an ALB-sourced rule for it, the ALB health-checks a
+port the firewall drops: every target goes unhealthy and every hostname returns 503,
+with nothing in any pod log to explain it.
+
+**Each environment serves frontend AND agent on one hostname, split by path.** That is
+forced by the app: `services/frontend/lib/api.ts` derives the agent URL in the browser
+and falls back to same-origin when the address has no port — which is the case behind
+the ALB on 443. Separate hostnames would break every API call.
+
 ### Created OUTSIDE Terraform
 
 These exist after a full deploy but Terraform does not manage them, which matters at
@@ -113,9 +169,21 @@ destroy time:
 
 ## 1. Cost, and the two things that will bite you
 
-**Roughly $0.07/hour ≈ $1.70/day ≈ $50/month** if left running: two `t3.medium`
-instances (~$0.0416/hr each in us-east-1) plus 60 GiB of gp3 (~$4.80/month). The data
-plane is on-demand DynamoDB and a nearly-empty bucket — cents.
+**Roughly $0.10/hour ≈ $2.40/day ≈ $70/month** if left running:
+
+| Item | Cost |
+|---|---|
+| 2 × `t3.medium` | ~$0.083/hr |
+| ALB | ~$0.0225/hr + LCU (~$16/month baseline) |
+| 60 GiB gp3 (node roots) | ~$4.80/month |
+| 4 GiB gp3 (Prometheus 3Gi + Grafana 1Gi) | ~$0.32/month |
+| Route 53 ALIAS queries, ACM certificate | free |
+| Data plane (on-demand DynamoDB, near-empty bucket) | cents |
+
+**The ALB and the EBS volumes survive an instance stop.** The budget keeper stopping
+your nodes does not stop those charges — only `terraform destroy` does. That is the
+practical difference between this stack and the pre-ingress one: there is now a
+meaningful bill that keeps running after the cluster is useless.
 
 **A stopped control plane is unrecoverable.** `kubeadm init` bakes the instance's
 public IP into the API server certificate's SANs. Stop the instance and it comes back
@@ -202,9 +270,9 @@ cp tfvars/us-east-1.tfvars.example tfvars/us-east-1.tfvars
 terraform plan -var-file=tfvars/us-east-1.tfvars
 ```
 
-Expected: **`Plan: 49 to add, 0 to change, 0 to destroy.`**
+Expected: **`Plan: 70 to add, 0 to change, 0 to destroy.`**
 
-**The `0 to change, 0 to destroy` half matters more than the 49.** In a shared
+**The `0 to change, 0 to destroy` half matters more than the 70.** In a shared
 account, any line that is not `will be created` means this config is about to touch
 something that is not Recall's — stop and read it before going further.
 
@@ -362,22 +430,35 @@ and the daily digest will publish successfully to nobody.
 **Order matters.** Doing this out of order leaves orphaned EBS volumes that keep
 billing and that `terraform destroy` cannot see.
 
-### 7a. Delete PVCs first — only if you created any
+### 7a. Delete the monitoring PVCs first — this step is now mandatory
 
 Volumes provisioned by the EBS CSI driver are created by the *controller*, not by
-Terraform, so they are invisible to `terraform destroy` and survive it.
+Terraform, so they are invisible to `terraform destroy` and survive it as orphaned EBS
+that keeps billing.
 
-Recall's four workloads are stateless (state is in DynamoDB), so there is normally
-nothing here. Check anyway:
+**A bootstrapped cluster always has two of them:** Prometheus claims 3Gi and Grafana
+1Gi against `ebs-sc` (see `infra/k8s/monitoring/values.yaml`). Recall's own four
+workloads are stateless, so before the monitoring stack existed this step was usually a
+no-op. It no longer is.
 
 ```bash
 kubectl get pvc --all-namespaces
-# If any exist:
-kubectl delete pvc --all -n <namespace>
+# Expect two in `monitoring`. Delete the namespace's claims:
+kubectl -n monitoring delete pvc --all
 ```
 
-Wait for the corresponding volumes to disappear from
-`aws ec2 describe-volumes --filters Name=status,Values=available` before continuing.
+Deleting the PVCs is enough — the CSI driver's `Delete` reclaim policy removes the
+underlying volumes. Confirm they are gone before continuing:
+
+```bash
+aws ec2 describe-volumes \
+  --filters "Name=status,Values=available" "Name=tag:Project,Values=recall" \
+  --query 'Volumes[].[VolumeId,Size]' --output table
+```
+
+An empty table is what you want. If volumes linger, delete them by the **specific IDs**
+that query returns — never in bulk, since this account holds 60+ loose volumes
+belonging to other students.
 
 ### 7b. Destroy
 
@@ -386,11 +467,18 @@ cd infra/terraform
 terraform destroy -var-file=tfvars/us-east-1.tfvars
 ```
 
-**~5 minutes.** Read the plan before confirming.
+**~8 minutes** now that an ALB is in the stack — load balancer deletion is the slow
+part, and the ACM certificate cannot go until its listener does. Read the plan before
+confirming.
 
 **This deletes all data.** The three DynamoDB tables and every card and review
 history in them, plus the uploads bucket and its contents. There is no backup:
 `point_in_time_recovery` defaults to `false`.
+
+**The six Route 53 records go too**, so every `*.recall.fursa.click` hostname stops
+resolving. The shared `fursa.click` zone itself is untouched — it is a data source, not
+a managed resource. The ACM certificate is deleted with the stack; a fresh apply issues
+a new one and re-validates in a minute or two.
 
 `prevent_destroy` is **off** on the tables and the bucket, and `force_destroy` is on
 for the bucket, specifically so this command works. That means the plan no longer
