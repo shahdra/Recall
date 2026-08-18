@@ -434,13 +434,21 @@ if [ -z "$ALERTS_SNS_TOPIC_ARN" ]; then
   AWS_REGION="$(curl -fsSL -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
     "http://169.254.169.254/latest/meta-data/placement/region" 2>/dev/null || true)"
   ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
-  # shellcheck disable=SC2016  # the backticks are JMESPath literals for --query,
-  # not command substitution; single quotes are required here.
-  CLUSTER_TAG="$(aws ec2 describe-instances \
-      --filters "Name=tag:Project,Values=recall" "Name=tag:Role,Values=control-plane" \
-                "Name=instance-state-name,Values=running" \
+  # Read this instance's OWN Cluster tag, rather than searching for a control plane
+  # by tag filter. Two reasons: the search needed a Project/Role filter that would
+  # match a classmate's instance in this shared account, and this node IS the control
+  # plane — asking IMDS who it is beats querying EC2 for something it already knows.
+  #
+  THIS_INSTANCE="$(curl -fsSL -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
+    "http://169.254.169.254/latest/meta-data/instance-id" 2>/dev/null || true)"
+  CLUSTER_TAG=""
+  if [ -n "$THIS_INSTANCE" ]; then
+    # shellcheck disable=SC2016  # backticks are JMESPath for --query, not command
+    # substitution; single quotes are required.
+    CLUSTER_TAG="$(aws ec2 describe-instances --instance-ids "$THIS_INSTANCE" \
       --query 'Reservations[0].Instances[0].Tags[?Key==`Cluster`].Value|[0]' \
       --output text 2>/dev/null || true)"
+  fi
   [ "$CLUSTER_TAG" = "None" ] && CLUSTER_TAG=""
   if [ -n "$AWS_REGION" ] && [ -n "$ACCOUNT_ID" ] && [ -n "$CLUSTER_TAG" ]; then
     ALERTS_SNS_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${ACCOUNT_ID}:${CLUSTER_TAG}-alerts"
