@@ -473,8 +473,18 @@ sed -e "s|__ALERTS_SNS_TOPIC_ARN__|${ALERTS_SNS_TOPIC_ARN}|g" \
     -e "s|__DOMAIN_ROOT__|${DOMAIN_ROOT}|g" \
     infra/k8s/monitoring/values.yaml > "$VALUES_RENDERED"
 # A leftover placeholder means a half-configured Alertmanager that publishes to a
-# literal "__ALERTS_SNS_TOPIC_ARN__" and drops every alert. Fail loudly instead.
-grep -q '__' "$VALUES_RENDERED" && fail "unsubstituted placeholder left in the rendered values file"
+# literal placeholder string and drops every alert. Fail loudly instead.
+#
+# Comment lines are excluded, and that is not a nicety: the values file DOCUMENTS its
+# own placeholders in a header comment, and a naive `grep -q '__'` matched that
+# documentation and aborted every run with "unsubstituted placeholder" while every
+# real placeholder had in fact been substituted correctly. Match the anchored
+# __NAME__ form on non-comment lines only.
+if grep -vE '^[[:space:]]*#' "$VALUES_RENDERED" | grep -qE '__[A-Z_]+__'; then
+  echo "Unsubstituted placeholders on these lines:" >&2
+  grep -nE '__[A-Z_]+__' "$VALUES_RENDERED" | grep -vE ':[[:space:]]*#' >&2
+  fail "unsubstituted placeholder left in the rendered values file"
+fi
 
 # `upgrade --install` is the idempotent form: installs on first run, upgrades in
 # place afterwards. --wait is left off because it would block for the full timeout
