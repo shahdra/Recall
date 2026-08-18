@@ -396,6 +396,11 @@ resource "aws_instance" "control_plane" {
   tags = {
     Name = "${var.cluster_name}-control-plane"
     Role = "control-plane"
+    # Cluster is what bootstrap.sh reads to derive the alerts SNS topic ARN when one
+    # is not passed in. The worker ASG propagates this tag to its instances, but a
+    # plain aws_instance has no such mechanism — so omitting it here left the control
+    # plane, the very node bootstrap runs ON, unable to identify its own cluster.
+    Cluster = var.cluster_name
   }
 }
 
