@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # bootstrap.sh — turn a freshly `kubeadm init`-ed control plane into a working
-# Recall cluster: CNI, storage, namespaces, secrets, ArgoCD, and the two ArgoCD
-# Applications that own every workload deploy from then on.
+# Recall cluster: CNI, storage, namespaces, secrets, the monitoring stack,
+# ingress-nginx, ArgoCD, and the ArgoCD Applications that own every workload deploy
+# from then on.
 #
 # THIS SCRIPT IS THE SECOND HALF OF THE DEPLOY. `terraform apply` gives you EC2
 # instances whose nodes report NotReady forever, because nothing has installed a
@@ -48,22 +49,54 @@
 #                    the ArgoCD Application manifests.
 #   REPO_URL         clone source if REPO_DIR is absent.
 #   REPO_REF         branch to check out (default: dev).
-#   SKIP_EBS_CSI     set to 1 to skip the EBS CSI driver. Nothing in Recall uses a
-#                    PersistentVolumeClaim today, so this is safe and saves ~1 min;
-#                    the default installs it so that adding Prometheus later needs no
-#                    IAM or bootstrap change.
+#   DOMAIN_ROOT      public domain root (default: recall.fursa.click). Must equal
+#                    `terraform output -raw domain_root`.
+#   ALERTS_SNS_TOPIC_ARN
+#                    topic Alertmanager publishes to. Derived from this node's own
+#                    tags and account when unset — the name is deterministic — so a
+#                    manual run works without reading Terraform outputs first.
+#   GRAFANA_ADMIN_PASSWORD
+#                    Grafana admin password. Generated once into a Secret if unset,
+#                    and printed only on the run that creates it.
+#   MONITORING_BASIC_AUTH_PASSWORD
+#                    password guarding the Prometheus and Alertmanager Ingresses,
+#                    neither of which has authentication of its own.
+#   SKIP_EBS_CSI     set to 1 to skip the EBS CSI driver AND the ebs-sc StorageClass.
+#                    Only safe if you also skip monitoring: Prometheus and Grafana
+#                    claim PVCs against that class and will sit Pending without it.
 
 set -euo pipefail
 
 # --- pinned versions -------------------------------------------------------
+# Every one of these is pinned rather than "latest"/"stable". A bootstrap script that
+# tracks a moving tag is a future outage with no code change to blame it on.
 CALICO_VERSION="v3.28.0"
 ARGOCD_VERSION="v2.13.2"
 EBS_CSI_VERSION="release-1.31"
+HELM_VERSION="v3.16.3"
+INGRESS_NGINX_CHART_VERSION="4.11.3"   # controller v1.11.3
+KUBE_PROM_STACK_CHART_VERSION="65.5.1" # Prometheus 2.55, Grafana 11.3
 
 # --- config ----------------------------------------------------------------
 REPO_DIR="${REPO_DIR:-$HOME/Recall}"
 REPO_URL="${REPO_URL:-https://github.com/shahdra/Recall.git}"
 REPO_REF="${REPO_REF:-dev}"
+
+# Public domain root. Must equal `terraform output -raw domain_root`; it is
+# substituted into the monitoring Helm values, where Prometheus and Grafana build
+# absolute URLs from it.
+DOMAIN_ROOT="${DOMAIN_ROOT:-recall.fursa.click}"
+
+# SNS topic Alertmanager publishes to. Must equal
+# `terraform output -raw alerts_sns_topic_arn`. Derived below from this node's own
+# identity when unset, so a manual run works without passing anything.
+ALERTS_SNS_TOPIC_ARN="${ALERTS_SNS_TOPIC_ARN:-}"
+
+# The ingress controller's node ports. INGRESS_HTTP_NODE_PORT MUST equal
+# var.ingress_http_node_port in infra/terraform — the ALB target group forwards
+# there, and step 8 asserts the installed Service agrees.
+INGRESS_HTTP_NODE_PORT="${INGRESS_HTTP_NODE_PORT:-30080}"
+INGRESS_HTTPS_NODE_PORT="${INGRESS_HTTPS_NODE_PORT:-30443}"
 
 export KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}"
 # admin.conf is root-owned mode 600; fall back to the ubuntu user's copy when this
@@ -76,7 +109,7 @@ step() { printf '\n=== %s ===\n' "$*"; }
 fail() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 # --- preflight -------------------------------------------------------------
-step "0/8 Preflight"
+step "0/12 Preflight"
 
 command -v kubectl >/dev/null || fail "kubectl not found. Did control-plane user-data finish?
 Check:  sudo tail -50 /var/log/user-data.log"
@@ -146,7 +179,7 @@ fi
 cd "$REPO_DIR"
 
 # --- 1. Calico CNI ---------------------------------------------------------
-step "1/8 Calico CNI ($CALICO_VERSION)"
+step "1/12 Calico CNI ($CALICO_VERSION)"
 # Nodes stay NotReady until a CNI is installed — this is the step that makes the
 # cluster schedulable. server-side apply because the tigera-operator manifest
 # contains CRDs whose annotations exceed the client-side apply size limit.
@@ -267,7 +300,7 @@ CALICO_INSTALLATION
 done
 
 # --- 2. Wait for nodes Ready ----------------------------------------------
-step "2/8 Waiting for all nodes to become Ready"
+step "2/12 Waiting for all nodes to become Ready"
 # Everything below needs schedulable nodes. The operator takes a moment to create the
 # calico-node DaemonSet, so give the condition a generous window.
 #
@@ -279,12 +312,13 @@ kubectl get nodes -o wide
 
 # --- 3. EBS CSI driver ----------------------------------------------------
 if [ "${SKIP_EBS_CSI:-0}" = "1" ]; then
-  step "3/8 EBS CSI driver — SKIPPED (SKIP_EBS_CSI=1)"
+  step "3/12 EBS CSI driver — SKIPPED (SKIP_EBS_CSI=1)"
 else
-  step "3/8 EBS CSI driver ($EBS_CSI_VERSION)"
-  # Nothing in Recall uses a PersistentVolumeClaim today — all four workloads are
-  # stateless with state in DynamoDB — so this is installed for the future
-  # (Prometheus/Grafana in Phase 7) rather than for a current need.
+  step "3/12 EBS CSI driver ($EBS_CSI_VERSION) + ebs-sc StorageClass"
+  # Recall's own four workloads are stateless — their state is in DynamoDB — but the
+  # monitoring stack installed in step 7 is not: Prometheus claims 3Gi and Grafana
+  # 1Gi against the `ebs-sc` class created below. Without the driver AND the class
+  # those claims sit Pending forever and neither pod ever starts.
   #
   # IAM (AmazonEBSCSIDriverPolicy) is already attached to both node roles by
   # infra/terraform/modules/k8s-cluster/main.tf, so no credential is needed here.
@@ -294,10 +328,14 @@ else
   # survive as orphaned EBS volumes that keep billing. Delete PVCs before destroying.
   # RUNBOOK.md §Destroy has the cleanup command.
   kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=${EBS_CSI_VERSION}"
+
+  # The class the monitoring PVCs name. WaitForFirstConsumer is load-bearing on a
+  # two-AZ cluster — see the comment in the file itself.
+  kubectl apply -f infra/k8s/ebs-storage-class.yaml
 fi
 
 # --- 4. Namespaces --------------------------------------------------------
-step "4/8 Namespaces (dev, prod, argocd)"
+step "4/12 Namespaces (dev, prod, argocd, monitoring, ingress-nginx)"
 # ONE cluster serves both environments, separated by namespace. This is also why
 # there is one set of DynamoDB tables and one bucket: the split is at the Kubernetes
 # layer, not the AWS layer.
@@ -305,12 +343,16 @@ step "4/8 Namespaces (dev, prod, argocd)"
 # ArgoCD's CreateNamespace=true would make dev and prod anyway, but they are created
 # here because step 5 puts a Secret in each — and that must happen BEFORE the first
 # sync, or the pods' first start hits CreateContainerConfigError.
-for ns in dev prod argocd; do
+#
+# monitoring and ingress-nginx are created here rather than left to Helm's
+# --create-namespace, because steps 7 and 8 put Secrets into monitoring before the
+# chart that would have created it is installed.
+for ns in dev prod argocd monitoring ingress-nginx; do
   kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f -
 done
 
 # --- 5. recall-secrets ----------------------------------------------------
-step "5/8 recall-secrets in dev and prod"
+step "5/12 recall-secrets in dev and prod"
 # Deliberately NOT in git. `create --dry-run | apply` makes this both idempotent and
 # updating: change the env file, re-run, and the Secret is patched.
 #
@@ -328,20 +370,167 @@ for ns in dev prod; do
   echo "  recall-secrets applied in $ns ($(grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' "$RECALL_ENV_FILE") keys)"
 done
 
-# --- 6. ArgoCD ------------------------------------------------------------
-step "6/8 ArgoCD ($ARGOCD_VERSION)"
+# --- 6. Helm ---------------------------------------------------------------
+step "6/12 Helm ($HELM_VERSION)"
+# ingress-nginx and kube-prometheus-stack are Helm charts, not plain manifests. The
+# charts are used rather than `helm template`-d output because the operator pattern
+# is the point: with kube-prometheus-stack, scrape config becomes a ServiceMonitor
+# custom resource instead of a ConfigMap nobody remembers to reload.
+if command -v helm >/dev/null 2>&1 && helm version --short 2>/dev/null | grep -q "${HELM_VERSION}"; then
+  echo "  helm ${HELM_VERSION} already installed"
+else
+  # A pinned tarball, not the get-helm-3 convenience script: that script installs
+  # whatever is newest, which is exactly the moving target this file avoids
+  # everywhere else.
+  tmp="$(mktemp -d)"
+  curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar -xz -C "$tmp"
+  sudo install -m 0755 "$tmp/linux-amd64/helm" /usr/local/bin/helm
+  rm -rf "$tmp"
+  echo "  installed $(helm version --short)"
+fi
+
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx >/dev/null
+helm repo update >/dev/null
+
+# --- 7. kube-prometheus-stack ---------------------------------------------
+step "7/12 kube-prometheus-stack ($KUBE_PROM_STACK_CHART_VERSION)"
+
+# Grafana's admin password. Created ONCE and then left alone — regenerating it on
+# every bootstrap would silently invalidate a password you had saved.
+if kubectl -n monitoring get secret grafana-admin >/dev/null 2>&1; then
+  echo "  grafana-admin secret already exists (password unchanged)"
+else
+  GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)}"
+  kubectl -n monitoring create secret generic grafana-admin \
+    --from-literal=admin-user=admin \
+    --from-literal=admin-password="$GRAFANA_ADMIN_PASSWORD" >/dev/null
+  echo "  grafana-admin created -> admin / $GRAFANA_ADMIN_PASSWORD"
+  echo "  (SAVE THIS. It is printed only on the run that creates it.)"
+fi
+
+# Basic-auth credentials for the Prometheus and Alertmanager Ingresses. Neither app
+# has any authentication of its own and both are about to be published on the public
+# internet — an open Alertmanager lets a stranger silence your alerts, so the
+# monitoring would look healthy precisely because someone turned it off. The Secret
+# must be in htpasswd format under the key `auth`.
+if kubectl -n monitoring get secret monitoring-basic-auth >/dev/null 2>&1; then
+  echo "  monitoring-basic-auth secret already exists"
+else
+  MONITORING_BASIC_AUTH_PASSWORD="${MONITORING_BASIC_AUTH_PASSWORD:-$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)}"
+  kubectl -n monitoring create secret generic monitoring-basic-auth \
+    --from-literal=auth="recall:$(openssl passwd -apr1 "$MONITORING_BASIC_AUTH_PASSWORD")" >/dev/null
+  echo "  monitoring-basic-auth created -> recall / $MONITORING_BASIC_AUTH_PASSWORD"
+  echo "  (SAVE THIS TOO.)"
+fi
+
+# The alerts topic ARN. Derived from this node's own identity when not passed, which
+# is what makes a manual `bash bootstrap.sh` work without reading Terraform outputs
+# first: the name is deterministic (see infra/terraform/alerts.tf), so it can be
+# reconstructed from the account id and the cluster's Name tag.
+if [ -z "$ALERTS_SNS_TOPIC_ARN" ]; then
+  IMDS_TOKEN="$(curl -fsSL -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)"
+  AWS_REGION="$(curl -fsSL -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
+    "http://169.254.169.254/latest/meta-data/placement/region" 2>/dev/null || true)"
+  ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+  # shellcheck disable=SC2016  # the backticks are JMESPath literals for --query,
+  # not command substitution; single quotes are required here.
+  CLUSTER_TAG="$(aws ec2 describe-instances \
+      --filters "Name=tag:Project,Values=recall" "Name=tag:Role,Values=control-plane" \
+                "Name=instance-state-name,Values=running" \
+      --query 'Reservations[0].Instances[0].Tags[?Key==`Cluster`].Value|[0]' \
+      --output text 2>/dev/null || true)"
+  [ "$CLUSTER_TAG" = "None" ] && CLUSTER_TAG=""
+  if [ -n "$AWS_REGION" ] && [ -n "$ACCOUNT_ID" ] && [ -n "$CLUSTER_TAG" ]; then
+    ALERTS_SNS_TOPIC_ARN="arn:aws:sns:${AWS_REGION}:${ACCOUNT_ID}:${CLUSTER_TAG}-alerts"
+    echo "  derived ALERTS_SNS_TOPIC_ARN=$ALERTS_SNS_TOPIC_ARN"
+  else
+    fail "could not derive ALERTS_SNS_TOPIC_ARN and none was passed.
+Pass it explicitly:  ALERTS_SNS_TOPIC_ARN=\$(terraform output -raw alerts_sns_topic_arn)
+Leaving it unset would install an Alertmanager that silently drops every alert."
+  fi
+fi
+AWS_REGION="${AWS_REGION:-us-east-1}"
+
+# Three values in the committed values file are only knowable after `terraform
+# apply`, so they are placeholders substituted into a temp copy here. `sed` rather
+# than envsubst: envsubst comes from gettext-base, which is not guaranteed on a
+# minimal Ubuntu image, and the values file also contains Go template syntax that
+# must not be touched.
+VALUES_RENDERED="$(mktemp)"
+trap 'rm -f "$VALUES_RENDERED"' EXIT
+sed -e "s|__ALERTS_SNS_TOPIC_ARN__|${ALERTS_SNS_TOPIC_ARN}|g" \
+    -e "s|__AWS_REGION__|${AWS_REGION}|g" \
+    -e "s|__DOMAIN_ROOT__|${DOMAIN_ROOT}|g" \
+    infra/k8s/monitoring/values.yaml > "$VALUES_RENDERED"
+# A leftover placeholder means a half-configured Alertmanager that publishes to a
+# literal "__ALERTS_SNS_TOPIC_ARN__" and drops every alert. Fail loudly instead.
+grep -q '__' "$VALUES_RENDERED" && fail "unsubstituted placeholder left in the rendered values file"
+
+# `upgrade --install` is the idempotent form: installs on first run, upgrades in
+# place afterwards. --wait is left off because it would block for the full timeout
+# on every re-run; readiness is checked below instead.
+helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --version "$KUBE_PROM_STACK_CHART_VERSION" \
+  --values "$VALUES_RENDERED" \
+  --timeout 10m
+
+# The CRDs this chart installs (ServiceMonitor, PrometheusRule) are what the ArgoCD
+# monitoring manifests depend on, so wait for them to be Established before moving
+# on — the same discovery-cache race as Calico's CRDs in step 1.
+for crd in servicemonitors.monitoring.coreos.com prometheusrules.monitoring.coreos.com; do
+  kubectl wait --for=condition=Established --timeout=120s "crd/$crd" >/dev/null 2>&1 \
+    || fail "CRD $crd never became Established"
+  echo "  $crd Established"
+done
+
+# Recall's own dashboard. A ConfigMap the Grafana sidecar discovers by label, so the
+# dashboard is a Kubernetes object rather than something clicked into the UI and lost
+# on the next pod restart.
+kubectl apply -f infra/k8s/monitoring/dashboard-configmap.yaml
+
+# --- 8. ingress-nginx ------------------------------------------------------
+step "8/12 ingress-nginx ($INGRESS_NGINX_CHART_VERSION)"
+# Installed AFTER kube-prometheus-stack because its values enable a ServiceMonitor,
+# and that CRD has to exist first.
+#
+# The node ports are pinned on the command line as well as in the values file, so the
+# coupling to Terraform is visible right here at the install call.
+helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx \
+  --version "$INGRESS_NGINX_CHART_VERSION" \
+  --values infra/k8s/ingress-nginx/values.yaml \
+  --set "controller.service.nodePorts.http=${INGRESS_HTTP_NODE_PORT}" \
+  --set "controller.service.nodePorts.https=${INGRESS_HTTPS_NODE_PORT}" \
+  --timeout 10m
+
+kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=300s
+
+# A wrong node port here means the ALB target group health-checks a port nothing
+# listens on: every target goes unhealthy and every hostname returns 503, with
+# nothing in any pod log to explain it. Assert it rather than hope.
+ACTUAL_PORT="$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+  -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}')"
+[ "$ACTUAL_PORT" = "$INGRESS_HTTP_NODE_PORT" ] \
+  || fail "ingress-nginx HTTP nodePort is $ACTUAL_PORT but the ALB target group expects $INGRESS_HTTP_NODE_PORT"
+echo "  HTTP NodePort pinned at $ACTUAL_PORT (matches the ALB target group)"
+
+# --- 9. ArgoCD ------------------------------------------------------------
+step "9/12 ArgoCD ($ARGOCD_VERSION)"
 kubectl apply -n argocd --server-side --force-conflicts \
   -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml"
 
-step "6b/8 Waiting for ArgoCD to be ready"
+step "9b/12 Waiting for ArgoCD to be ready"
 # The application controller must be up before the Applications are applied, or they
 # sit unprocessed with no status.
 kubectl -n argocd rollout status deploy/argocd-server      --timeout=300s
 kubectl -n argocd rollout status deploy/argocd-repo-server --timeout=300s
 kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
 
-# --- 7. ArgoCD Applications ----------------------------------------------
-step "7/8 ArgoCD Applications"
+# --- 10. ArgoCD Applications ----------------------------------------------
+step "10/12 ArgoCD Applications"
 # Two Applications, one per environment — not the app-of-apps fan-out the reference
 # project uses. Recall's four workloads release together, so per-service Applications
 # would add indirection without buying independent sync.
@@ -357,8 +546,27 @@ step "7/8 ArgoCD Applications"
 kubectl apply -f infra/argo/recall-dev.yaml
 kubectl apply -f infra/argo/recall-prod.yaml
 
-# --- 8. Summary ----------------------------------------------------------
-step "8/8 Summary"
+# --- 11. Platform Ingresses -------------------------------------------------
+step "11/12 Platform Ingresses (argocd, grafana, prometheus, alertmanager)"
+# Applied here rather than by ArgoCD, deliberately: these route to the infrastructure
+# bootstrap itself installs, INCLUDING ArgoCD's own UI. Making ArgoCD responsible for
+# the front door to ArgoCD is a circular dependency you discover at the worst moment.
+#
+# Runs AFTER step 9 so argocd-server exists to be patched.
+# ArgoCD's server must be told to serve plain HTTP. It normally serves HTTPS
+# with a self-signed cert and redirects HTTP to HTTPS, which behind a TLS-terminating
+# ALB is an infinite redirect: nginx forwards http://, argocd answers 307 to https://,
+# the ALB terminates TLS and forwards http:// again.
+kubectl -n argocd patch configmap argocd-cmd-params-cm \
+  --type merge -p '{"data":{"server.insecure":"true"}}' >/dev/null 2>&1 || \
+  kubectl -n argocd create configmap argocd-cmd-params-cm \
+    --from-literal=server.insecure=true --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n argocd rollout restart deploy/argocd-server >/dev/null 2>&1 || true
+
+kubectl apply -f infra/k8s/platform/ingress.yaml
+
+# --- 12. Summary ----------------------------------------------------------
+step "12/12 Summary"
 
 echo "ArgoCD admin password:"
 # Once you rotate the password and delete this Secret, the get returns non-zero.
@@ -388,20 +596,25 @@ if [ -n "$IMDS_TOKEN" ]; then
 fi
 
 echo
+echo "Public URLs (HTTPS, via the ALB -> ingress-nginx):"
+echo "  dev            https://dev.${DOMAIN_ROOT}"
+echo "  prod           https://${DOMAIN_ROOT}            (after argocd app sync)"
+echo "  ArgoCD         https://argocd.${DOMAIN_ROOT}"
+echo "  Grafana        https://grafana.${DOMAIN_ROOT}"
+echo "  Prometheus     https://prometheus.${DOMAIN_ROOT}    (basic auth: recall)"
+echo "  Alertmanager   https://alertmanager.${DOMAIN_ROOT}  (basic auth: recall)"
+echo
+echo "Each environment serves the frontend AND the tutor-agent on ONE hostname, split"
+echo "by path. That is required, not stylistic: the browser derives the agent URL at"
+echo "runtime (services/frontend/lib/api.ts) and falls back to the SAME ORIGIN when"
+echo "there is no port in the address — which is the case behind the ALB on 443."
+echo
 if [ -n "$PUBLIC_IP" ]; then
-  echo "App URLs (NodePort, reachable on any node — this is the control plane's IP):"
+  echo "Direct NodePort access still works, for debugging DNS or the ALB out of the path:"
   echo "  dev  frontend     http://${PUBLIC_IP}:30300"
   echo "  dev  tutor-agent  http://${PUBLIC_IP}:30800"
-  echo "  prod frontend     http://${PUBLIC_IP}:31300   (after argocd app sync)"
+  echo "  prod frontend     http://${PUBLIC_IP}:31300"
   echo "  prod tutor-agent  http://${PUBLIC_IP}:31800"
-  echo
-  echo "Both ports of each pair must be open: the BROWSER calls tutor-agent directly,"
-  echo "deriving its URL as frontendPort+500 (services/frontend/lib/api.ts). A"
-  echo "reachable frontend with an unreachable agent renders a page whose every"
-  echo "request fails."
-else
-  echo "Could not read this node's public IP from IMDS."
-  echo "  Get it with:  terraform output control_plane_public_ip"
 fi
 
 echo

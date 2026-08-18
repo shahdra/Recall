@@ -192,12 +192,23 @@ resource "aws_iam_role_policy_attachment" "worker_ssm_core" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-# Workers may READ the join command and nothing else.
+# Workers may READ the join command, and publish alerts.
 data "aws_iam_policy_document" "worker_ssm_read" {
   statement {
     sid       = "ReadJoinCommand"
     actions   = ["ssm:GetParameter"]
     resources = ["arn:aws:ssm:${var.region}:*:parameter${local.join_command_param}"]
+  }
+
+  # Alertmanager runs on a worker and publishes alerts to SNS using this role's
+  # credentials via the instance metadata service — there is no IRSA on a kubeadm
+  # cluster, so a pod cannot assume a role of its own. Scoped to the alerts topic
+  # ARN alone: the account is shared, and a wildcard would let anything on a node
+  # publish to a classmate's topic.
+  statement {
+    sid       = "PublishAlerts"
+    actions   = ["sns:Publish"]
+    resources = [var.alerts_topic_arn]
   }
 }
 

@@ -227,6 +227,62 @@ variable "ssh_private_key_path" {
   default     = "~/.ssh/shahd-key.pem"
 }
 
+# ===========================================================================
+# Ingress — public DNS, TLS, and the load balancer
+# ===========================================================================
+
+variable "base_domain" {
+  description = <<-EOT
+    The SHARED Route 53 hosted zone, read with a data source and never managed by
+    this stack. Every student in the account has records in it, so declaring it as a
+    resource would let `terraform destroy` delete everyone's.
+  EOT
+  type        = string
+  default     = "fursa.click"
+}
+
+variable "subdomain" {
+  description = <<-EOT
+    Recall's label under `base_domain`, giving the domain root recall.fursa.click.
+
+    Deliberately NOT the student name: the reference project in this same account
+    and hosted zone uses that, and sharing it would mean whichever stack applied
+    second repointed the other's DNS at its own load balancer, with both ACM
+    certificates competing over identical validation records.
+  EOT
+  type        = string
+  default     = "recall"
+}
+
+variable "ingress_http_node_port" {
+  description = <<-EOT
+    NodePort the ingress-nginx controller is pinned to, and the port the ALB target
+    group forwards to. Must match `controller.service.nodePorts.http` in
+    infra/k8s/ingress-nginx/values.yaml — bootstrap.sh asserts it.
+
+    Note this is OUTSIDE the app's own 30300-30800 / 31300-31800 ranges, so the
+    worker security group gets a dedicated ALB-sourced rule for it (see
+    modules/ingress). Without that rule every hostname returns 503.
+  EOT
+  type        = number
+  default     = 30080
+}
+
+variable "alert_email" {
+  description = <<-EOT
+    Where Alertmanager's alerts are emailed, via SNS. Leave empty to create the topic
+    without a subscriber — alerts still publish, they just reach nobody until someone
+    subscribes.
+
+    AWS emails a confirmation link the first time this is applied and delivers
+    nothing until it is clicked. Terraform reports the subscription as created
+    regardless, so `PendingConfirmation` is what to check when alerts fire but no
+    mail arrives.
+  EOT
+  type        = string
+  default     = ""
+}
+
 variable "ssh_ingress_cidr" {
   description = <<-EOT
     Source CIDR allowed to reach SSH (22) and the Kubernetes API (6443).

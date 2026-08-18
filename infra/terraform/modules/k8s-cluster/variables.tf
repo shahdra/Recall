@@ -87,6 +87,15 @@ variable "app_policy_json" {
   type        = string
 }
 
+variable "alerts_topic_arn" {
+  description = <<-EOT
+    SNS topic Alertmanager publishes to. The worker role gets `sns:Publish` on this
+    ARN only, so the Alertmanager pod can send alerts using the node's instance-role
+    credentials instead of a static key — there is no IRSA on a kubeadm cluster.
+  EOT
+  type        = string
+}
+
 variable "owner" {
   description = <<-EOT
     Owner tag value, repeated onto ASG-launched instances. Terraform's provider-level

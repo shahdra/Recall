@@ -1,0 +1,107 @@
+# Ingress — dev.recall.fursa.click
+#
+# ONE hostname serves both the frontend and the tutor-agent, split by path. That is
+# not a stylistic choice; it is what the frontend requires.
+#
+# ── Why one host and not two ────────────────────────────────────────────────
+# services/frontend/lib/api.ts:21-35 derives the agent's URL in the BROWSER at
+# runtime, because NEXT_PUBLIC_* values are inlined at build time and would
+# otherwise mean one image per environment. Its rule is:
+#
+#     agent port = frontend port + 500        (dev 30300 -> 30800)
+#     ...but with NO explicit port, fall back to the SAME ORIGIN
+#
+# Behind the ALB the page is served from https://dev.recall.fursa.click with no
+# port, so that fallback fires and every API call goes to the same hostname. Giving
+# the agent its own host (agent.dev.recall...) would therefore break every request:
+# the browser would keep calling the frontend's host and get the Next.js 404 page
+# instead of JSON. Path routing is what makes the existing runtime rule correct.
+#
+# ── Path order matters ──────────────────────────────────────────────────────
+# ingress-nginx evaluates by longest matching prefix, not document order, so the
+# agent's specific paths win over the frontend's "/" regardless of how they are
+# listed. They are listed first anyway, so a reader sees the specific rules before
+# the catch-all.
+#
+# The agent's paths (/decks, /session, /transcribe, /health, /demo, /chat, /metrics)
+# do not collide with any frontend route (/, /add, /study, /progress) — verified
+# against services/tutor-agent/app.py and the frontend's app/ directory.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: recall-dev
+  namespace: dev
+  labels:
+    app.kubernetes.io/part-of: recall
+  annotations:
+    # Deck creation from a PDF is an LLM call over the whole document and regularly
+    # takes 30-90s. These override the controller's 60s defaults for THIS host only,
+    # so a slow upload is not cut off with a 504 for a request that would have
+    # succeeded. The chart-wide values raise them too; this is belt and braces for
+    # the one route that actually needs it.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "180"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "180"
+    # PDFs. The controller default of 1m rejects a normal lecture deck with a 413.
+    nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: dev.recall.fursa.click
+      http:
+        paths:
+          # --- tutor-agent: every API path the browser calls directly ---------
+          - path: /decks
+            pathType: Prefix
+            backend:
+              service:
+                name: tutor-agent
+                port:
+                  number: 8000
+          - path: /session
+            pathType: Prefix
+            backend:
+              service:
+                name: tutor-agent
+                port:
+                  number: 8000
+          - path: /transcribe
+            pathType: Prefix
+            backend:
+              service:
+                name: tutor-agent
+                port:
+                  number: 8000
+          - path: /chat
+            pathType: Prefix
+            backend:
+              service:
+                name: tutor-agent
+                port:
+                  number: 8000
+          # The frontend polls /health to decide whether to show the demo clock, so
+          # it has to be reachable from the browser like the rest.
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: tutor-agent
+                port:
+                  number: 8000
+          # The demo clock control (RECALL_DEMO_MODE), enabled in dev only. The prod
+          # Ingress deliberately omits this path — see the note there.
+          - path: /demo
+            pathType: Prefix
+            backend:
+              service:
+                name: tutor-agent
+                port:
+                  number: 8000
+
+          # --- frontend: everything else --------------------------------------
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 3000
