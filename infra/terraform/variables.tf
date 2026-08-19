@@ -79,6 +79,17 @@ variable "uploads_retention_days" {
   default     = 90
 }
 
+variable "logs_retention_days" {
+  description = <<-EOT
+    Days before a shipped container-log object is expired from S3. Shorter than
+    uploads_retention_days on purpose: logs are read to debug something that just
+    happened — observability-mcp caps a single lookback at 24 hours — so keeping
+    months of them costs storage without answering a question anyone asks.
+  EOT
+  type        = number
+  default     = 14
+}
+
 # --- DynamoDB durability ---------------------------------------------------
 
 variable "point_in_time_recovery" {

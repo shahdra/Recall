@@ -31,6 +31,15 @@ output "uploads_bucket" {
   value       = aws_s3_bucket.uploads.bucket
 }
 
+output "logs_bucket" {
+  description = <<-EOT
+    Where Fluent Bit ships container logs. Export it as PROD_LOGS_BUCKET (or
+    DEV_LOGS_BUCKET) for services/observability-mcp, and substitute it into the
+    DaemonSet's ConfigMap during bootstrap.
+  EOT
+  value       = aws_s3_bucket.logs.bucket
+}
+
 output "reminders_topic_arn" {
   description = "RECALL_SNS_TOPIC_ARN — the reminder CronJob publishes the daily digest here."
   value       = aws_sns_topic.reminders.arn

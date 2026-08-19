@@ -107,6 +107,36 @@ data "aws_iam_policy_document" "app" {
     }
   }
 
+  # Fluent Bit ships container logs from every node. PutObject only, scoped to the
+  # logs/ prefix: the shipper never reads, lists, or deletes, so a compromised
+  # sidecar cannot exfiltrate the archive it writes into. That asymmetry is the
+  # reason GetObject is absent here while it is present for uploads/ above.
+  statement {
+    sid    = "ShipContainerLogs"
+    effect = "Allow"
+
+    actions = [
+      "s3:PutObject",
+    ]
+
+    resources = ["${aws_s3_bucket.logs.arn}/logs/*"]
+  }
+
+  # Multipart needs these, and only on the parts being uploaded. Without them a
+  # log object big enough to trigger multipart fails halfway with an AccessDenied
+  # that reads like a bucket-policy problem and is not one.
+  statement {
+    sid    = "CompleteMultipartLogUploads"
+    effect = "Allow"
+
+    actions = [
+      "s3:AbortMultipartUpload",
+      "s3:ListMultipartUploadParts",
+    ]
+
+    resources = ["${aws_s3_bucket.logs.arn}/logs/*"]
+  }
+
   # --- SNS ------------------------------------------------------------------
   #
   # Publish only. The reminder CronJob sends the digest; nothing in Recall
