@@ -1,0 +1,239 @@
+# Fluent Bit — ships every container's logs to S3, tagged with Kubernetes metadata.
+#
+# A DaemonSet, because container logs are files on the node: each pod writes to
+# /var/log/containers/<pod>_<ns>_<container>-<id>.log, and only a pod ON that node
+# can read them. One replica per node, mounting the host log directory read-only.
+#
+# WHY SHIP AT ALL, WHEN `kubectl logs` EXISTS.
+# A pod's logs die with the pod, and the failures worth investigating are
+# disproportionately the ones that killed it — an OOM kill, a crashloop, a node
+# rotated out by the ASG. By the time anyone looks, kubectl has nothing. Shipping
+# is what makes "what happened at 14:02 yesterday" answerable.
+#
+# WHY THE `kubernetes` FILTER IS LOAD-BEARING.
+# The raw record has a filename and a container id, neither of which anyone knows.
+# The filter calls the API server and attaches pod name, namespace, and labels, so
+# a human can ask for "tutor-agent" instead of a container hash — and so a query
+# can be scoped to one namespace, which is how dev and prod stay separable in one
+# bucket.
+#
+# PLACEHOLDERS: __LOGS_BUCKET__ and __AWS_REGION__ are substituted by
+# bootstrap.sh, the same way it renders the monitoring Helm values, because the
+# bucket name embeds the account id and is only known after `terraform apply`.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit
+  namespace: monitoring
+---
+# The kubernetes filter enriches records by asking the API server about the pod
+# that wrote them, so it needs read access to pods across all namespaces. Read
+# only, and no access to secrets or anything else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluent-bit-read
+rules:
+  - apiGroups: [""]
+    resources:
+      - namespaces
+      - pods
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluent-bit-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluent-bit-read
+subjects:
+  - kind: ServiceAccount
+    name: fluent-bit
+    namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-config
+  namespace: monitoring
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush             5
+        Log_Level         info
+        Daemon            off
+        Parsers_File      parsers.conf
+        # Exposes Fluent Bit's own metrics, and gives the probes something to hit.
+        HTTP_Server       On
+        HTTP_Listen       0.0.0.0
+        HTTP_Port         2020
+        # Survives a restart: the DB records how far into each file it has read, so
+        # a rolling update does not re-ship the last hour of every log.
+        storage.path      /var/log/flb-storage/
+        storage.sync      normal
+
+    [INPUT]
+        Name              tail
+        Tag               kube.*
+        Path              /var/log/containers/*.log
+        # Exclude our own logs, or shipping produces logs that get shipped.
+        Exclude_Path      /var/log/containers/fluent-bit*
+        # containerd writes the CRI format, not Docker's JSON. Using the wrong
+        # parser leaves every record's message as an unparsed blob.
+        multiline.parser  cri
+        DB                /var/log/flb-storage/kube.db
+        Mem_Buf_Limit     16MB
+        Skip_Long_Lines   On
+        Refresh_Interval  10
+
+    [FILTER]
+        Name                kubernetes
+        Match               kube.*
+        # Must agree with the INPUT tag above; the filter parses the pod,
+        # namespace and container out of the tag to build its API lookup.
+        Kube_Tag_Prefix     kube.var.log.containers.
+        Merge_Log           On
+        Keep_Log            On
+        K8S-Logging.Parser  On
+        K8S-Logging.Exclude On
+        Labels              On
+        Annotations         Off
+
+    [FILTER]
+        Name          record_modifier
+        Match         kube.*
+        # Which node produced the record. The kubernetes filter does not add this,
+        # and it is what separates "the app is broken" from "one node is broken".
+        Record        host ${NODE_NAME}
+
+    [OUTPUT]
+        Name                          s3
+        Match                         kube.*
+        bucket                        __LOGS_BUCKET__
+        region                        __AWS_REGION__
+        # Read by services/observability-mcp/logs.py:day_prefixes — the two must
+        # agree or a query lists prefixes that hold nothing.
+        s3_key_format                 /logs/%Y/%m/%d/$TAG[3]_%H%M%S_$UUID.gz
+        s3_key_format_tag_delimiters  .
+        compression                   gzip
+        # Upload on whichever comes first. The size bound keeps a busy cluster's
+        # objects readable; the timeout bounds how stale the archive can be, which
+        # is what decides whether a query about "just now" finds anything.
+        total_file_size               10M
+        upload_timeout                2m
+        # Credentials come from the node role via IMDS — no keys in this manifest.
+        use_put_object                On
+        store_dir                     /var/log/flb-storage/s3
+        store_dir_limit_size          256M
+        # Never block the log pipeline waiting on S3: buffer to disk and retry.
+        retry_limit                   5
+
+  parsers.conf: |
+    [PARSER]
+        Name        cri
+        Format      regex
+        Regex       ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]*) (?<log>.*)$
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: monitoring
+  labels:
+    app: fluent-bit
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit
+  template:
+    metadata:
+      labels:
+        app: fluent-bit
+      annotations:
+        # Roll the pods when the config changes: a ConfigMap edit alone does not
+        # restart anything, so without this a new config silently does nothing
+        # until the next unrelated rollout.
+        checksum/config: __CONFIG_CHECKSUM__
+    spec:
+      serviceAccountName: fluent-bit
+      # Logs must keep shipping from a node under pressure — losing telemetry
+      # exactly when a node is struggling is losing it when it matters.
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 30
+      tolerations:
+        # Run on the control plane too. Its components are part of "what happened",
+        # and without this toleration the DaemonSet silently skips that node.
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:3.1.9
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 2020
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            # A log shipper must never be the reason a node runs out of memory.
+            # The limit is deliberately close to Mem_Buf_Limit + the S3 store, so
+            # a backlog gets dropped rather than growing until the node suffers.
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          securityContext:
+            # Reading the host's log files needs root: they are owned by root and
+            # written by the container runtime. Everything else is dropped, and
+            # the mounts below are read-only, so this cannot write to the host.
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+              # NOT read-only: the tail DB and the S3 store buffer live under
+              # /var/log/flb-storage, and both need writing.
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - name: config
+              mountPath: /fluent-bit/etc/
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            # /var/log/containers holds symlinks into this directory, so the
+            # symlink targets are unreadable without mounting it too. A tail that
+            # finds the file and cannot follow it logs nothing and looks healthy.
+            path: /var/lib/docker/containers
+        - name: config
+          configMap:
+            name: fluent-bit-config
