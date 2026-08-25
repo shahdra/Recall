@@ -43,7 +43,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: frontend
-          image: shahdra/recall-frontend:21e3abbd3110b9ebdf7134b08d0bfdbe1076c924
+          image: shahdra/recall-frontend:e866c5fe4019fdb30a073013025673a86ef1c848
           ports:
             - name: http
               containerPort: 3000
